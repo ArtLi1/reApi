@@ -1,5 +1,6 @@
 import json
 from urllib.parse import parse_qs
+from HTTP.http_errors import BodyParameterError
 
 
 class HTTPRequest:
@@ -35,9 +36,10 @@ class HTTPRequest:
 
         # application/json
         if content_type.startswith("application/json"):
-            self.json = json.loads(
-                self.raw_body.decode("utf-8")
-            )
+            try:
+                self.json = json.loads(self.raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise BodyParameterError("Invalid JSON body") from e
 
         # application/x-www-form-urlencoded
         elif content_type.startswith("application/x-www-form-urlencoded"):
@@ -68,27 +70,19 @@ class HTTPRequest:
 
             if not header_data:
                 continue
-
             headers = {}
-
             for line in header_data.decode("utf-8").split("\r\n"):
                 key, value = line.split(":", 1)
                 headers[key.lower()] = value.strip()
-
             disposition = headers.get("content-disposition", "")
-
             params = {}
-
             for item in disposition.split(";")[1:]:
                 if "=" in item:
                     key, value = item.strip().split("=", 1)
                     params[key] = value.strip('"')
-
             name = params.get("name")
-
             if not name:
                 continue
-
             # 文件
             if "filename" in params:
                 self.files[name] = {
@@ -99,7 +93,6 @@ class HTTPRequest:
                     ),
                     "content": content
                 }
-
             # 普通表单字段
             else:
                 self.form[name] = content.decode("utf-8")

@@ -1,10 +1,15 @@
-import json
 import re
-from typing import get_args
-from urllib.parse import urlsplit, parse_qs
-from HTTP.http_models import *
-from HTTP.http_request import HTTPRequest
 from inspect import signature
+from typing import get_args, get_origin
+from urllib.parse import urlsplit, parse_qs
+from HTTP.http_errors import (
+    BodyParameterError,
+    PathParameterError,
+    QueryParameterError,
+    RouteNotFoundError,
+)
+from HTTP.http_models import Body, Path, Query
+from HTTP.http_request import HTTPRequest
 
 
 class HTTPRouter:
@@ -42,16 +47,33 @@ class HTTPRouter:
     def param_handler(self, request: HTTPRequest, func):
         args = []
         for name, param in signature(func).parameters.items():
-            typ = get_args(param.annotation)
+            annotation = param.annotation
+            typ = get_args(annotation)
             if param.annotation == HTTPRequest:
                 args.append(request)
-            elif param.annotation == Path[typ[0]]:
-                args.append(Path[typ[0]](typ[0](request.path_params[name])))
-            elif param.annotation == Query[typ[0]]:
-                args.append(Query[typ[0]](typ[0](request.query[name])))
-            elif param.annotation == Body[typ[0]]:
-                # data = json.loads(request.json)
-                args.append(Body[typ[0]](typ[0](**request.json)))
+            elif get_origin(annotation) is Path:
+                if name not in request.path_params:
+                    raise PathParameterError(f"Missing path parameter: {name}")
+                try:
+                    args.append(annotation(typ[0](request.path_params[name])))
+                except (TypeError, ValueError) as e:
+                    raise PathParameterError(f"Invalid path parameter: {name}") from e
+            elif get_origin(annotation) is Query:
+                if name not in request.query:
+                    raise QueryParameterError(f"Missing query parameter: {name}")
+                try:
+                    args.append(annotation(typ[0](request.query[name])))
+                except (TypeError, ValueError) as e:
+                    raise QueryParameterError(f"Invalid query parameter: {name}") from e
+            elif get_origin(annotation) is Body:
+                if request.json is None:
+                    raise BodyParameterError("Missing JSON body")
+                if not isinstance(request.json, dict):
+                    raise BodyParameterError("JSON body must be an object")
+                try:
+                    args.append(annotation(typ[0](**request.json)))
+                except (TypeError, ValueError) as e:
+                    raise BodyParameterError(f"Invalid body parameter: {name}") from e
             else:
                 args.append(None)
         return func(*args)
@@ -61,7 +83,7 @@ class HTTPRouter:
         method = request.method.upper()
 
         if method not in self.listening:
-            return None
+            raise RouteNotFoundError(f"No route for {method} {path}")
 
         # 1. 解析 URL
         url = urlsplit(path)
@@ -109,4 +131,4 @@ class HTTPRouter:
             if match:
                 request.path_params = match.groupdict()
                 return self.param_handler(request, func)
-        return None
+        raise RouteNotFoundError(f"No route for {method} {real_path}")

@@ -5,6 +5,8 @@ import socket
 
 from HTTP.http_request import HTTPRequest
 from HTTP.http_response import HTTPResponse
+from HTTP.http_errors import HTTPError
+from Utils import ContentType
 
 
 class HTTPServer:
@@ -44,8 +46,21 @@ class HTTPServer:
 
         return head + b"\r\n\r\n" + body
 
-    def error_handler(self, e:Exception) -> HTTPResponse:
-        pass
+    def error_handler(self, e: Exception) -> HTTPResponse:
+        if isinstance(e, HTTPError):
+            return HTTPResponse(
+                body={"error": str(e)},
+                content_type=ContentType.JSON,
+                code=e.code,
+                status=e.status
+            )
+        print(f"Request error: {e}")
+        return HTTPResponse(
+            body={"error": "Internal Server Error"},
+            content_type=ContentType.JSON,
+            code=500,
+            status="Internal Server Error"
+        )
 
     def run(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
@@ -66,13 +81,10 @@ class HTTPServer:
                         request = HTTPRequest.construct_from_bytes(raw)
 
                         response = self.router.router(request)
-
-                        if response is None:
-                            response = HTTPResponse(
-                                body="404 Not Found",
-                                code=404,
-                                status="Not Found"
-                            )
-                        client.sendall(response.response())
+                        payload = response.response()
                     except Exception as e:
-                        print(f"Request error: {e}")
+                        payload = self.error_handler(e).response()
+                    try:
+                        client.sendall(payload)
+                    except OSError as e:
+                        print(f"Response error: {e}")
