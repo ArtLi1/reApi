@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-from Utils import *
+from Utils import ContentType
 
 
 class HTTPResponse:

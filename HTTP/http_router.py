@@ -40,37 +40,25 @@ class HTTPRouter:
             raise ValueError("Expected true or false")
         return typ(value)
 
-    def get_method(self, path: str):
+    def _method(self, method: str, path: str):
         def decorator(func):
             self._validate_params(func)
-            self.listening['GET'][path] = func
+            self.listening[method][path] = func
             return func
 
         return decorator
+
+    def get_method(self, path: str):
+        return self._method('GET', path)
 
     def post_method(self, path: str):
-        def decorator(func):
-            self._validate_params(func)
-            self.listening['POST'][path] = func
-            return func
-
-        return decorator
+        return self._method('POST', path)
 
     def put_method(self, path: str):
-        def decorator(func):
-            self._validate_params(func)
-            self.listening['PUT'][path] = func
-            return func
-
-        return decorator
+        return self._method('PUT', path)
 
     def delete_method(self, path: str):
-        def decorator(func):
-            self._validate_params(func)
-            self.listening['DELETE'][path] = func
-            return func
-
-        return decorator
+        return self._method('DELETE', path)
 
     def param_handler(self, request: HTTPRequest, func):
         args = []

@@ -48,18 +48,15 @@ class HTTPServer:
 
     def error_handler(self, e: Exception) -> HTTPResponse:
         if isinstance(e, HTTPError):
-            return HTTPResponse(
-                body={"error": str(e)},
-                content_type=ContentType.JSON,
-                code=e.code,
-                status=e.status
-            )
-        print(f"Request error: {e}")
+            code, status, message = e.code, e.status, str(e)
+        else:
+            print(f"Request error: {e}")
+            code, status, message = 500, "Internal Server Error", "Internal Server Error"
         return HTTPResponse(
-            body={"error": "Internal Server Error"},
+            body={"error": message},
             content_type=ContentType.JSON,
-            code=500,
-            status="Internal Server Error"
+            code=code,
+            status=status
         )
 
     def run(self):

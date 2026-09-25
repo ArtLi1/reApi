@@ -1,10 +1,8 @@
-import json
-
 from HTTP.http_models import Path, Query, Body
 from HTTP.http_request import HTTPRequest
 from HTTP.http_response import HTTPResponse
 from HTTP.http_server import HTTPServer
-from Utils import *
+from Utils import ContentType
 
 server = HTTPServer()
 

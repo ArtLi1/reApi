@@ -2,19 +2,20 @@ from typing import Generic, TypeVar
 
 T = TypeVar("T")
 
-# query path仅支持int str bool float四种类型 body要求contentType为application/json 且body为合法json字符串
-class Path(Generic[T]):
+
+class BaseParam(Generic[T]):
     def __init__(self, value: T):
-        super().__init__(value)
+        self.value = value
 
 
-class Query(Generic[T]):
-    def __init__(self, value: T):
-        super().__init__(value)
+# Path 和 Query 仅支持 str、int、float、bool；Body 绑定 JSON 对象。
+class Path(BaseParam[T]):
+    pass
 
 
-class Body(Generic[T]):
-    def __init__(self, value: T):
-        super().__init__(value)
+class Query(BaseParam[T]):
+    pass
 
 
+class Body(BaseParam[T]):
+    pass
