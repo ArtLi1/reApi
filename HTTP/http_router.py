@@ -1,7 +1,7 @@
 import re
 from inspect import signature
 from typing import get_args, get_origin
-from urllib.parse import urlsplit, parse_qs
+from urllib.parse import urlsplit, parse_qs, unquote
 from HTTP.http_errors import (
     BodyParameterError,
     PathParameterError,
@@ -16,8 +16,33 @@ class HTTPRouter:
     def __init__(self):
         self.listening = {'GET': {}, 'POST': {}, 'PUT': {}, 'DELETE': {}}
 
+    @staticmethod
+    def _validate_params(func):
+        for name, param in signature(func).parameters.items():
+            annotation = param.annotation
+            kind = get_origin(annotation) or annotation
+            if kind in (Path, Query):
+                args = get_args(annotation)
+                # URL 参数只支持可明确从文本解析的四种基本类型。
+                if len(args) != 1 or args[0] not in (str, int, float, bool):
+                    raise TypeError(f"{func.__name__}.{name} must be Path/Query[str, int, float, or bool]")
+
+    @staticmethod
+    def _parse_basic(value: str, typ: type):
+        if not isinstance(value, str):
+            raise ValueError("Expected a single value")
+        if typ is bool:
+            # bool("false") 也会得到 True，因此布尔值必须显式解析。
+            if value.lower() == "true":
+                return True
+            if value.lower() == "false":
+                return False
+            raise ValueError("Expected true or false")
+        return typ(value)
+
     def get_method(self, path: str):
         def decorator(func):
+            self._validate_params(func)
             self.listening['GET'][path] = func
             return func
 
@@ -25,6 +50,7 @@ class HTTPRouter:
 
     def post_method(self, path: str):
         def decorator(func):
+            self._validate_params(func)
             self.listening['POST'][path] = func
             return func
 
@@ -32,6 +58,7 @@ class HTTPRouter:
 
     def put_method(self, path: str):
         def decorator(func):
+            self._validate_params(func)
             self.listening['PUT'][path] = func
             return func
 
@@ -39,6 +66,7 @@ class HTTPRouter:
 
     def delete_method(self, path: str):
         def decorator(func):
+            self._validate_params(func)
             self.listening['DELETE'][path] = func
             return func
 
@@ -55,17 +83,22 @@ class HTTPRouter:
                 if name not in request.path_params:
                     raise PathParameterError(f"Missing path parameter: {name}")
                 try:
-                    args.append(annotation(typ[0](request.path_params[name])))
+                    # 匹配路由后再解码，避免 %2F 提前变成路径分隔符。
+                    args.append(annotation(self._parse_basic(unquote(request.path_params[name]), typ[0])))
                 except (TypeError, ValueError) as e:
                     raise PathParameterError(f"Invalid path parameter: {name}") from e
             elif get_origin(annotation) is Query:
                 if name not in request.query:
                     raise QueryParameterError(f"Missing query parameter: {name}")
                 try:
-                    args.append(annotation(typ[0](request.query[name])))
+                    args.append(annotation(self._parse_basic(request.query[name], typ[0])))
                 except (TypeError, ValueError) as e:
                     raise QueryParameterError(f"Invalid query parameter: {name}") from e
             elif get_origin(annotation) is Body:
+                # Body[T] 只绑定 JSON 对象；其他请求体格式仍可由 HTTPRequest 单独使用。
+                media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if media_type != "application/json":
+                    raise BodyParameterError("Body requires application/json")
                 if request.json is None:
                     raise BodyParameterError("Missing JSON body")
                 if not isinstance(request.json, dict):
@@ -91,7 +124,7 @@ class HTTPRouter:
 
         request.query = {
             key: values[0] if len(values) == 1 else values
-            for key, values in parse_qs(url.query).items()
+            for key, values in parse_qs(url.query, keep_blank_values=True).items()
         }
         request.path_params = {}
         routes = self.listening[method]

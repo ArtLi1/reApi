@@ -30,19 +30,20 @@ class HTTPRequest:
 
     def _parse_body(self):
         content_type = self.headers.get("content-type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
 
         if not self.raw_body:
             return
 
         # application/json
-        if content_type.startswith("application/json"):
+        if media_type == "application/json":
             try:
                 self.json = json.loads(self.raw_body.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as e:
                 raise BodyParameterError("Invalid JSON body") from e
 
         # application/x-www-form-urlencoded
-        elif content_type.startswith("application/x-www-form-urlencoded"):
+        elif media_type == "application/x-www-form-urlencoded":
             data = parse_qs(
                 self.raw_body.decode("utf-8"),
                 keep_blank_values=True
@@ -54,11 +55,19 @@ class HTTPRequest:
             }
 
         # multipart/form-data
-        elif content_type.startswith("multipart/form-data"):
+        elif media_type == "multipart/form-data":
             self._parse_multipart(content_type)
 
     def _parse_multipart(self, content_type: str):
-        boundary = content_type.split("boundary=", 1)[1].strip().strip('"')
+        # 参数名不区分大小写；缺少 boundary 时返回明确的请求错误。
+        boundary = None
+        for option in content_type.split(";")[1:]:
+            key, separator, value = option.partition("=")
+            if separator and key.strip().lower() == "boundary":
+                boundary = value.strip().strip('"')
+                break
+        if not boundary:
+            raise BodyParameterError("Missing multipart boundary")
         separator = b"--" + boundary.encode()
 
         self.form = {}
