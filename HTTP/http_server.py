@@ -48,11 +48,13 @@ class HTTPServer:
         with self._state_lock:
             return self._modules[module_class]
 
-    def _resolve_module(self, module_class):
+    def _resolve_module(self, module_class, optional=False):
         with self._state_lock:
             if not self._modules_ready:
                 raise RuntimeError("Module injection is only available after server_init")
             if module_class not in self._modules:
+                if optional:
+                    return None
                 raise RuntimeError(f"Module is not registered: {module_class.__name__}")
             return self._modules[module_class]
 

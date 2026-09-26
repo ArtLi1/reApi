@@ -2,7 +2,8 @@ import math
 import re
 from inspect import signature
 from threading import Lock
-from typing import get_args, get_origin, get_type_hints
+from types import UnionType
+from typing import Union, get_args, get_origin, get_type_hints
 from urllib.parse import urlsplit, parse_qs, unquote
 from HTTP.http_errors import (
     BodyParameterError,
@@ -36,8 +37,8 @@ class HTTPRouter:
             for func, stage in callbacks:
                 parameters = self._parameters[(func, stage)]
                 for param in parameters.values():
-                    annotation = param.annotation
-                    if self._is_module(annotation) and annotation not in module_classes:
+                    annotation, optional = self._unwrap_optional(param.annotation)
+                    if self._is_module(annotation) and not optional and annotation not in module_classes:
                         raise TypeError(f"{func.__name__} requires unregistered module: {annotation.__name__}")
             self._frozen = True
 
@@ -73,7 +74,8 @@ class HTTPRouter:
                 parameters = self._validate_params(func, "handler")
                 path_names = re.findall(r"\{([^{}]+)\}", path)
                 for name, param in parameters.items():
-                    if get_origin(param.annotation) is Path and name not in path_names:
+                    annotation, optional = self._unwrap_optional(param.annotation)
+                    if get_origin(annotation) is Path and not optional and name not in path_names:
                         raise TypeError(f"{func.__name__}.{name} is not in route path: {path}")
                 self._parameters[(func, "handler")] = parameters
                 self.listening[method][path] = func
@@ -103,13 +105,22 @@ class HTTPRouter:
     def _is_module(annotation):
         return isinstance(annotation, type) and issubclass(annotation, ServerModule)
 
+    @staticmethod
+    def _unwrap_optional(annotation):
+        # 仅支持 T | None / Optional[T]，保留多类型联合供声明校验拒绝。
+        args = get_args(annotation)
+        if get_origin(annotation) in (Union, UnionType) and len(args) == 2 and type(None) in args:
+            return next(arg for arg in args if arg is not type(None)), True
+        return annotation, False
+
     def _validate_params(self, func, stage):
         hints = get_type_hints(func)
         parameters = {}
         for name, param in signature(func).parameters.items():
             if param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
                 raise TypeError(f"{func.__name__}.{name} must be a named parameter")
-            annotation = hints.get(name, param.annotation)
+            declared = hints.get(name, param.annotation)
+            annotation, _ = self._unwrap_optional(declared)
             kind = get_origin(annotation) or annotation
             if annotation is HTTPRequest or self._is_module(annotation):
                 pass
@@ -127,7 +138,7 @@ class HTTPRouter:
                     raise TypeError(f"{func.__name__}.{name} must be Body[ModelClass]")
             else:
                 raise TypeError(f"Unsupported annotation for {func.__name__}.{name}: {annotation}")
-            parameters[name] = param.replace(annotation=annotation)
+            parameters[name] = param.replace(annotation=declared)
         return parameters
 
     @staticmethod
@@ -162,7 +173,7 @@ class HTTPRouter:
         """按注解绑定命名参数；模块仅从服务器获取，绝不在请求中创建。"""
         args = {}
         for name, param in self._parameters[(func, stage)].items():
-            annotation = param.annotation
+            annotation, optional = self._unwrap_optional(param.annotation)
             typ = get_args(annotation)
             if annotation is HTTPRequest:
                 args[name] = request
@@ -173,9 +184,12 @@ class HTTPRouter:
             elif self._is_module(annotation):
                 if self._module_resolver is None:
                     raise RuntimeError("Module injection requires an HTTPServer")
-                args[name] = self._module_resolver(annotation)
+                args[name] = self._module_resolver(annotation, optional=optional)
             elif get_origin(annotation) is Path:
                 if name not in request.path_params:
+                    if optional:
+                        args[name] = None
+                        continue
                     if param.default is not param.empty:
                         continue
                     raise RuntimeError(f"{func.__name__}.{name} is not available in this route")
@@ -186,6 +200,9 @@ class HTTPRouter:
                     raise PathParameterError(f"Invalid path parameter: {name}") from e
             elif get_origin(annotation) is Query:
                 if name not in request.query:
+                    if optional:
+                        args[name] = None
+                        continue
                     if param.default is not param.empty:
                         continue
                     raise QueryParameterError(f"Missing query parameter: {name}")
@@ -194,7 +211,11 @@ class HTTPRouter:
                 except (TypeError, ValueError) as e:
                     raise QueryParameterError(f"Invalid query parameter: {name}") from e
             elif get_origin(annotation) is Body:
-                if not request.raw_body and param.default is not param.empty:
+                # 缺失请求体可省略；显式 JSON null 或非法内容仍需报错。
+                if optional and not request.raw_body and request.json is None:
+                    args[name] = None
+                    continue
+                if not optional and not request.raw_body and param.default is not param.empty:
                     continue
                 # Body[T] 只绑定 JSON 对象；其他请求体格式仍可由 HTTPRequest 单独使用。
                 media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -236,7 +257,8 @@ class HTTPRouter:
             raise TypeError("Handlers must return HTTPResponse")
         for hook, hook_args in after_calls:
             for name, param in self._parameters[(hook, "after")].items():
-                if param.annotation is HTTPResponse:
+                annotation, _ = self._unwrap_optional(param.annotation)
+                if annotation is HTTPResponse:
                     hook_args[name] = response
             updated = hook(**hook_args)
             if updated is not None:
