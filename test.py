@@ -23,12 +23,14 @@ class Module1(ServerModule):
         self.b = b
 
     def server_init(self):
-        print(self.a, self.b)
+        print("module1 success init")
+
+    def l1(self):
+        print("module1 func l1 success")
 
 
 @server.router.before_handler("/**", 0)
 def b1(req: HTTPRequest):
-    req.path_params["id"] = "-2"
     return req
 
 
@@ -38,9 +40,10 @@ def b2(req: HTTPRequest, res: HTTPResponse):
 
 
 @server.router.get_method("/1/{id}/{uid}")
-def f1(request: HTTPRequest, id: Path[int], uid: Path[int]):
+def f1(request: HTTPRequest, id: Path[int], q1: Query[int], module1: Module1):
     print(id.value)
-    print(uid.value)
+    print(q1.value)
+    print(module1.l1())
     print(request.path_params["id"])
     return HTTPResponse(body=f"Hello World!{request.path_params["id"]},{request.path_params["uid"]}",
                         content_type=ContentType.HTML)

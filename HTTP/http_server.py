@@ -23,13 +23,14 @@ class HTTPServer:
         self.port = port
         self.max_workers = max_workers
         self.request_timeout = request_timeout
-        self.router = http_router.HTTPRouter()
         self._modules = {}
+        self._modules_ready = False
         self._initialized_modules = []
         self._initialization_started = False
         self._started = False
         self._state_lock = RLock()
         self._stop_event = Event()
+        self.router = http_router.HTTPRouter(self._resolve_module)
 
     def register_module(self, module_class, *args, **kwargs):
         if not isinstance(module_class, type) or not issubclass(module_class, ServerModule):
@@ -45,6 +46,14 @@ class HTTPServer:
 
     def get_module(self, module_class):
         with self._state_lock:
+            return self._modules[module_class]
+
+    def _resolve_module(self, module_class):
+        with self._state_lock:
+            if not self._modules_ready:
+                raise RuntimeError("Module injection is only available after server_init")
+            if module_class not in self._modules:
+                raise RuntimeError(f"Module is not registered: {module_class.__name__}")
             return self._modules[module_class]
 
     def _recv_request(self, client: socket.socket) -> bytes:
@@ -102,8 +111,13 @@ class HTTPServer:
             # 先记录，确保初始化失败时也能释放该模块已创建的部分资源。
             self._initialized_modules.append(module)
             module.server_init()
+        with self._state_lock:
+            # 全部模块初始化成功后才允许请求注入，避免使用尚未就绪的资源。
+            self._modules_ready = True
 
     def _close_modules(self):
+        with self._state_lock:
+            self._modules_ready = False
         for module in reversed(self._initialized_modules):
             try:
                 module.server_close()
@@ -141,7 +155,6 @@ class HTTPServer:
             if self._started:
                 raise RuntimeError("This server instance has already been started")
             self._started = True
-        self.router.freeze()
         slots = BoundedSemaphore(self.max_workers)
 
         def client_done(future):
@@ -151,6 +164,7 @@ class HTTPServer:
                 print(f"Client worker error: {error}")
 
         try:
+            self.router.freeze(self._modules)
             self.server_init()
             with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="http") as executor:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
