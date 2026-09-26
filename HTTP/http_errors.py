@@ -8,6 +8,16 @@ class RouteNotFoundError(HTTPError):
     status = "Not Found"
 
 
+class MethodNotAllowedError(HTTPError):
+    code = 405
+    status = "Method Not Allowed"
+
+    def __init__(self, message, allowed_methods):
+        super().__init__(message)
+        self.allowed_methods = tuple(allowed_methods)
+        self.headers = {"Allow": ", ".join(self.allowed_methods)}
+
+
 class PathParameterError(HTTPError):
     code = 400
     status = "Bad Request"

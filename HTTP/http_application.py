@@ -61,7 +61,8 @@ class HTTPApplication:
             body={"error": message},
             content_type=ContentType.JSON,
             code=code,
-            status=status
+            status=status,
+            headers=dict(getattr(e, "headers", {})) if isinstance(e, HTTPError) else None
         )
 
     def startup(self):
@@ -102,7 +103,11 @@ class HTTPApplication:
 
     def dispatch_request(self, request: HTTPRequest):
         """执行内部流程并保留异常，供测试或上层异常边界调用。"""
-        return self._execute(request, self.router.match(request))
+        func = self.router.match(request)
+        # 自动 OPTIONS 仅描述路由能力，不执行业务参数绑定及路由 Hook。
+        if func is self.router._automatic_options:
+            return func(request)
+        return self._execute(request, func)
 
     def handle_request(self, request: HTTPRequest):
         try:
@@ -121,7 +126,9 @@ class HTTPApplication:
             status, headers, body = self.error_handler(error).to_wsgi()
         # start_response 的服务器异常不能再次包装成另一份响应。
         start_response(status, headers)
-        return [body]
+        # Application 负责 HEAD 语义，换用外部 WSGI Server 也不会发送正文。
+        # Content-Length 保留正常响应长度，after 仍处理完整 Response。
+        return [b"" if environ.get("REQUEST_METHOD", "").upper() == "HEAD" else body]
 
     def _execute(self, request: HTTPRequest, func):
         # 匹配路由后执行 before，再绑定参数；异常交给 Application 统一处理。

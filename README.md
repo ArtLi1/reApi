@@ -72,6 +72,59 @@ Application 管理，按注册类注入同一个实例。共享模块需要支�
 `app.dispatch_request(request)` 保留异常，便于针对内部行为测试；
 `app.handle_request(request)` 将处理异常转为响应。WSGI 入口还覆盖请求构造时的错误。
 
+## 路由注册与分组
+
+```python
+from HTTP import HTTPApplication, HTTPRouter, HTTPResponse, Path
+
+app = HTTPApplication()
+items = HTTPRouter(prefix="/items")
+
+@items.route("/{id}", methods=["GET", "PATCH"])
+def item(id: Path[int]):
+    return HTTPResponse(str(id.value))
+
+@items.after_handler("/**", priority=0)
+def mark(response: HTTPResponse):
+    response.headers["X-Group"] = "items"
+
+app.router.include_router(items, prefix="/api/v1")
+# 实际路径：/api/v1/items/{id}；Hook 同时挂载到 /api/v1/items/**。
+```
+
+- `route(path, methods=("GET",))` 支持多个方法，方法名统一为大写；
+  `methods` 应为列表或元组等可迭代集合，不能直接传字符串。
+- 保留 `get_method`、`post_method`、`put_method`、`delete_method`；
+  新增 `patch_method`、`head_method`、`options_method`。
+- prefix 只能包含字面路径段；支持嵌套 include，多层 prefix 依次拼接。
+- include 复制子路由当时的路由和 Hook，后续注册不会自动同步；模块由最终 Application
+  注册和注入。相同优先级的 Hook 按父路由实际注册/挂载顺序执行。
+- 路径以 `/` 开始，参数和 `*` / `**` 必须占据完整段；参数名为 ASCII 标识符且不能重复。
+  不允许查询串、片段、控制字符及空路径段。非法声明在注册时失败。
+- 末尾 `/` 与无末尾 `/` 等价；同一方法下的重复或同形路径直接报错，
+  如 `/items/{id}`、`/items/{name}`、`/items/*`。不同方法可使用不同参数名。
+- 匹配时从左到右比较路径段：字面段优先于单段参数/`*`，再优先于 `**`；
+  完整路径优先于继续匹配的通配路径。具体程度完全相同的重叠模式按资源首次注册顺序处理。
+- **先选最具体的路径资源，再选择方法。** 若 GET `/items/new` 与 POST `/items/{id}`
+  同时存在，POST `/items/new` 返回 405，避免落入动态 Handler。
+- 所有路由、Hook 和 include 操作都必须在应用启动前完成。
+
+### HTTP 方法行为
+
+| 请求情况 | 行为 |
+|---|---|
+| 路径不存在 | 404 |
+| 路径存在、方法不支持 | 405，携带 `Allow` |
+| HEAD | 显式 HEAD 优先，否则复用 GET；Handler 仍收到 HEAD 方法 |
+| 自动 OPTIONS | 返回 204 和 `Allow`，跳过 Handler、路由 Hook 和业务参数校验 |
+| 显式 OPTIONS | 执行正常 Handler / Hook 流程，响应由 Handler 定义 |
+
+`Allow` 按名称排序，包含显式方法、自动 OPTIONS，以及 GET 对应的 HEAD。
+HEAD 的 Hook 处理完整 Response；Application 在 WSGI 输出时去掉正文，保留正常响应的
+`Content-Length`，包括错误响应。内部 dispatch / handle 返回的 Response 仍保留正文。
+自动 OPTIONS 仅提供方法能力信息；CORS 响应头需要由应用另行定义。
+方法语义参考 [RFC 9110](https://httpwg.org/specs/rfc9110.html)。
+
 ## 参数与 Hook
 
 - `HTTPRequest`、模块类型：Handler、before、after 均可注入。
