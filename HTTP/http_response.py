@@ -5,7 +5,6 @@ from Utils import ContentType
 
 
 class HTTPResponse:
-
     def __init__(
         self,
         body: Any = "",
@@ -27,7 +26,6 @@ class HTTPResponse:
         self.headers["Content-Length"] = str(len(self.body))
 
     def _build_body(self, body: Any) -> bytes:
-
         # JSON
         if self.content_type == ContentType.JSON:
             return json.dumps(
@@ -44,19 +42,11 @@ class HTTPResponse:
         return str(body).encode("utf-8")
 
     def response(self) -> bytes:
-
-        status_line = (
-            f"{self.version} {self.code} {self.status}\r\n"
-        )
+        status_line = f"{self.version} {self.code} {self.status}\r\n"
 
         headers = "".join(
             f"{key}: {value}\r\n"
             for key, value in self.headers.items()
         )
 
-        return (
-            status_line.encode("utf-8")
-            + headers.encode("utf-8")
-            + b"\r\n"
-            + self.body
-        )
+        return (status_line + headers + "\r\n").encode("utf-8") + self.body

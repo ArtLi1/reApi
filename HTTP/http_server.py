@@ -1,14 +1,13 @@
-from HTTP import http_router
-
 import math
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore, Event, RLock
 
+from HTTP import http_router
+from HTTP.http_errors import HTTPError
 from HTTP.http_module import ServerModule
 from HTTP.http_request import HTTPRequest
 from HTTP.http_response import HTTPResponse
-from HTTP.http_errors import HTTPError
 from Utils import ContentType
 
 
@@ -59,14 +58,15 @@ class HTTPServer:
             return self._modules[module_class]
 
     def _recv_request(self, client: socket.socket) -> bytes:
-        data = b""
+        # 可变缓冲区避免每次 recv 都复制已经读取的全部内容。
+        data = bytearray()
 
         # 读取完整 Header
         while b"\r\n\r\n" not in data:
             chunk = client.recv(4096)
             if not chunk:
                 return b""
-            data += chunk
+            data.extend(chunk)
 
         head, _, body = data.partition(b"\r\n\r\n")
 
@@ -85,9 +85,9 @@ class HTTPServer:
             chunk = client.recv(4096)
             if not chunk:
                 break
-            body += chunk
+            body.extend(chunk)
 
-        return head + b"\r\n\r\n" + body
+        return bytes(head + b"\r\n\r\n" + body)
 
     def error_handler(self, e: Exception) -> HTTPResponse:
         if isinstance(e, HTTPError):

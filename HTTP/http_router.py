@@ -1,10 +1,12 @@
 import math
 import re
+from functools import lru_cache
 from inspect import signature
 from threading import Lock
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
-from urllib.parse import urlsplit, parse_qs, unquote
+from urllib.parse import unquote, urlsplit
+
 from HTTP.http_errors import (
     BodyParameterError,
     PathParameterError,
@@ -15,6 +17,7 @@ from HTTP.http_models import Body, Path, Query
 from HTTP.http_module import ServerModule
 from HTTP.http_request import HTTPRequest
 from HTTP.http_response import HTTPResponse
+from Utils import parse_url_parameters
 
 
 class HTTPRouter:
@@ -108,9 +111,10 @@ class HTTPRouter:
     @staticmethod
     def _unwrap_optional(annotation):
         # 仅支持 T | None / Optional[T]，保留多类型联合供声明校验拒绝。
-        args = get_args(annotation)
-        if get_origin(annotation) in (Union, UnionType) and len(args) == 2 and type(None) in args:
-            return next(arg for arg in args if arg is not type(None)), True
+        if get_origin(annotation) in (Union, UnionType):
+            args = get_args(annotation)
+            if len(args) == 2 and type(None) in args:
+                return next(arg for arg in args if arg is not type(None)), True
         return annotation, False
 
     def _validate_params(self, func, stage):
@@ -147,15 +151,18 @@ class HTTPRouter:
             raise ValueError("Expected a single value")
         if typ is bool:
             # bool("false") 也会得到 True，因此布尔值必须显式解析。
-            if value.lower() == "true":
+            normalized = value.lower()
+            if normalized == "true":
                 return True
-            if value.lower() == "false":
+            if normalized == "false":
                 return False
             raise ValueError("Expected true or false")
         return typ(value)
 
     @staticmethod
-    def _match_path(pattern_path: str, real_path: str):
+    @lru_cache(maxsize=256)
+    def _compile_path(pattern_path: str):
+        # 模式固定且会被各请求重复使用；有界缓存避免持续注册模式时无限增长。
         regex_parts = []
         for part in pattern_path.strip("/").split("/"):
             if part.startswith("{") and part.endswith("}"):
@@ -167,14 +174,18 @@ class HTTPRouter:
             else:
                 regex_parts.append(re.escape(part))
         pattern = "^/" + "/".join(regex_parts) + "/?$"
-        return re.fullmatch(pattern, real_path)
+        return re.compile(pattern)
+
+    @staticmethod
+    def _match_path(pattern_path: str, real_path: str):
+        return HTTPRouter._compile_path(pattern_path).fullmatch(real_path)
 
     def param_handler(self, request: HTTPRequest, func, response=None, stage="handler"):
         """按注解绑定命名参数；模块仅从服务器获取，绝不在请求中创建。"""
         args = {}
         for name, param in self._parameters[(func, stage)].items():
             annotation, optional = self._unwrap_optional(param.annotation)
-            typ = get_args(annotation)
+            kind = get_origin(annotation)
             if annotation is HTTPRequest:
                 args[name] = request
             elif annotation is HTTPResponse:
@@ -185,32 +196,27 @@ class HTTPRouter:
                 if self._module_resolver is None:
                     raise RuntimeError("Module injection requires an HTTPServer")
                 args[name] = self._module_resolver(annotation, optional=optional)
-            elif get_origin(annotation) is Path:
-                if name not in request.path_params:
+            elif kind in (Path, Query):
+                is_path = kind is Path
+                values = request.path_params if is_path else request.query
+                error = PathParameterError if is_path else QueryParameterError
+                label = "path" if is_path else "query"
+                if name not in values:
                     if optional:
                         args[name] = None
                         continue
                     if param.default is not param.empty:
                         continue
-                    raise RuntimeError(f"{func.__name__}.{name} is not available in this route")
-                try:
-                    # 匹配路由后再解码，避免 %2F 提前变成路径分隔符。
-                    args[name] = annotation(self._parse_basic(unquote(request.path_params[name]), typ[0]))
-                except (TypeError, ValueError) as e:
-                    raise PathParameterError(f"Invalid path parameter: {name}") from e
-            elif get_origin(annotation) is Query:
-                if name not in request.query:
-                    if optional:
-                        args[name] = None
-                        continue
-                    if param.default is not param.empty:
-                        continue
+                    if is_path:
+                        raise RuntimeError(f"{func.__name__}.{name} is not available in this route")
                     raise QueryParameterError(f"Missing query parameter: {name}")
                 try:
-                    args[name] = annotation(self._parse_basic(request.query[name], typ[0]))
+                    # 匹配路由后再解码，避免 %2F 提前变成路径分隔符。
+                    value = unquote(values[name]) if is_path else values[name]
+                    args[name] = annotation(self._parse_basic(value, get_args(annotation)[0]))
                 except (TypeError, ValueError) as e:
-                    raise QueryParameterError(f"Invalid query parameter: {name}") from e
-            elif get_origin(annotation) is Body:
+                    raise error(f"Invalid {label} parameter: {name}") from e
+            elif kind is Body:
                 # 缺失请求体可省略；显式 JSON null 或非法内容仍需报错。
                 if optional and not request.raw_body and request.json is None:
                     args[name] = None
@@ -218,8 +224,7 @@ class HTTPRouter:
                 if not optional and not request.raw_body and param.default is not param.empty:
                     continue
                 # Body[T] 只绑定 JSON 对象；其他请求体格式仍可由 HTTPRequest 单独使用。
-                media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                if media_type != "application/json":
+                if request.media_type != "application/json":
                     raise BodyParameterError("Body requires application/json")
                 if request.json is None:
                     raise BodyParameterError("Missing JSON body")
@@ -227,7 +232,7 @@ class HTTPRouter:
                     raise BodyParameterError("JSON body must be an object")
                 try:
                     # 各函数分别构造模型，构造函数应只解析数据，不执行数据库等业务操作。
-                    args[name] = annotation(typ[0](**request.json))
+                    args[name] = annotation(get_args(annotation)[0](**request.json))
                 except (TypeError, ValueError) as e:
                     raise BodyParameterError(f"Invalid body parameter: {name}") from e
         return args
@@ -278,10 +283,7 @@ class HTTPRouter:
         url = urlsplit(path)
         real_path = url.path
 
-        request.query = {
-            key: values[0] if len(values) == 1 else values
-            for key, values in parse_qs(url.query, keep_blank_values=True).items()
-        }
+        request.query = parse_url_parameters(url.query)
         request.path_params = {}
         routes = self.listening[method]
         # 2. 优先精确匹配

@@ -1,6 +1,7 @@
 import json
-from urllib.parse import parse_qs
+
 from HTTP.http_errors import BodyParameterError
+from Utils import parse_url_parameters
 
 
 class HTTPRequest:
@@ -28,9 +29,13 @@ class HTTPRequest:
         self.path_params = {}
         self._parse_body()
 
+    @property
+    def media_type(self) -> str:
+        """每次从当前 Header 读取，确保 before 修改 Header 后仍使用最新值。"""
+        return self.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
     def _parse_body(self):
-        content_type = self.headers.get("content-type", "")
-        media_type = content_type.split(";", 1)[0].strip().lower()
+        media_type = self.media_type
 
         if not self.raw_body:
             return
@@ -44,19 +49,11 @@ class HTTPRequest:
 
         # application/x-www-form-urlencoded
         elif media_type == "application/x-www-form-urlencoded":
-            data = parse_qs(
-                self.raw_body.decode("utf-8"),
-                keep_blank_values=True
-            )
-
-            self.form = {
-                key: values[0] if len(values) == 1 else values
-                for key, values in data.items()
-            }
+            self.form = parse_url_parameters(self.raw_body.decode("utf-8"))
 
         # multipart/form-data
         elif media_type == "multipart/form-data":
-            self._parse_multipart(content_type)
+            self._parse_multipart(self.headers.get("content-type", ""))
 
     def _parse_multipart(self, content_type: str):
         # 参数名不区分大小写；缺少 boundary 时返回明确的请求错误。

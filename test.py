@@ -42,12 +42,19 @@ def b2(req: HTTPRequest, res: HTTPResponse):
 
 
 @server.router.get_method("/1/{id}/{uid}")
-def f1(request: HTTPRequest, id: Path[int], q1: Query[int], module1: Module1, q2: Query[int] | None,q3:Optional[Query[int]]):
+def f1(
+    request: HTTPRequest,
+    id: Path[int],
+    q1: Query[int],
+    module1: Module1,
+    q2: Query[int] | None,
+    q3: Optional[Query[int]],
+):
     print(q1.value)
     print(q2)
     print(q3)
     print(request.path_params["id"])
-    return HTTPResponse(body=f"Hello World!{request.path_params["id"]},{request.path_params["uid"]}",
+    return HTTPResponse(body=f"Hello World!{request.path_params['id']},{request.path_params['uid']}",
                         content_type=ContentType.HTML)
 
 
@@ -57,7 +64,7 @@ def t2(request: HTTPRequest, id: Path[int], q1: Query[int], uid: Path[int], user
     print(q1.value)
     print(uid.value)
     print(user.value)
-    return HTTPResponse(body=f"Hello World!{request.path_params["id"]},{request.path_params["uid"]}",
+    return HTTPResponse(body=f"Hello World!{request.path_params['id']},{request.path_params['uid']}",
                         content_type=ContentType.HTML)
 
 
