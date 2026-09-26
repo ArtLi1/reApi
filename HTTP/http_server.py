@@ -1,6 +1,5 @@
 from HTTP import http_router
 
-
 import socket
 
 from HTTP.http_request import HTTPRequest
@@ -59,7 +58,12 @@ class HTTPServer:
             status=status
         )
 
+    def server_init(self):
+        pass
+
     def run(self):
+        self.server_init()
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
