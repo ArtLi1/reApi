@@ -1,6 +1,7 @@
 import math
 import re
 from inspect import signature
+from threading import Lock
 from typing import get_args, get_origin
 from urllib.parse import urlsplit, parse_qs, unquote
 from HTTP.http_errors import (
@@ -18,9 +19,15 @@ class HTTPRouter:
         self.listening = {'GET': {}, 'POST': {}, 'PUT': {}, 'DELETE': {}}
         self._before_handlers = []
         self._after_handlers = []
+        self._frozen = False
+        self._registration_lock = Lock()
 
-    @staticmethod
-    def _register_hook(hooks, path: str, priority: int | float):
+    def freeze(self):
+        """服务器启动后，路由和 Hook 保持只读，供各请求线程共享。"""
+        with self._registration_lock:
+            self._frozen = True
+
+    def _register_hook(self, hooks, path: str, priority: int | float):
         if not isinstance(path, str):
             raise TypeError("Hook path must be a string")
         if not path.startswith("/") or any(
@@ -33,17 +40,23 @@ class HTTPRouter:
             raise ValueError("Hook priority must be a finite number >= 0")
 
         def decorator(func):
-            hooks.append((priority, path, func))
-            # Python 的排序稳定：相同优先级保持注册顺序。
-            hooks.sort(key=lambda hook: hook[0])
+            with self._registration_lock:
+                if self._frozen:
+                    raise RuntimeError("Hooks must be registered before run")
+                hooks.append((priority, path, func))
+                # Python 的排序稳定：相同优先级保持注册顺序。
+                hooks.sort(key=lambda hook: hook[0])
             return func
 
         return decorator
 
     def _method(self, method: str, path: str):
         def decorator(func):
-            self._validate_params(func)
-            self.listening[method][path] = func
+            with self._registration_lock:
+                if self._frozen:
+                    raise RuntimeError("Routes must be registered before run")
+                self._validate_params(func)
+                self.listening[method][path] = func
             return func
 
         return decorator
@@ -145,7 +158,7 @@ class HTTPRouter:
         return args
 
     def request_handler(self, request: HTTPRequest, func):
-        # 参数绑定成功后才进入钩子；钩子异常交给 HTTPServer 统一处理。
+        # 匹配路由后执行 before，再绑定参数；异常交给 HTTPServer 统一处理。
         real_path = urlsplit(request.path).path
         for _, path, hook in self._before_handlers:
             if self._match_path(path, real_path):
