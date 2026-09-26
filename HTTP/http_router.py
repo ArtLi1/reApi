@@ -1,3 +1,4 @@
+import math
 import re
 from inspect import signature
 from typing import get_args, get_origin
@@ -15,6 +16,55 @@ from HTTP.http_request import HTTPRequest
 class HTTPRouter:
     def __init__(self):
         self.listening = {'GET': {}, 'POST': {}, 'PUT': {}, 'DELETE': {}}
+        self._before_handlers = []
+        self._after_handlers = []
+
+    @staticmethod
+    def _register_hook(hooks, path: str, priority: int | float):
+        if not isinstance(path, str):
+            raise TypeError("Hook path must be a string")
+        if not path.startswith("/") or any(
+                "{" in part or "}" in part or ("*" in part and part not in ("*", "**"))
+                for part in path.strip("/").split("/")
+        ):
+            raise ValueError("Hook path only supports /* and /** wildcards")
+        if (isinstance(priority, bool) or not isinstance(priority, (int, float))
+                or priority < 0 or (isinstance(priority, float) and not math.isfinite(priority))):
+            raise ValueError("Hook priority must be a finite number >= 0")
+
+        def decorator(func):
+            hooks.append((priority, path, func))
+            # Python 的排序稳定：相同优先级保持注册顺序。
+            hooks.sort(key=lambda hook: hook[0])
+            return func
+
+        return decorator
+
+    def _method(self, method: str, path: str):
+        def decorator(func):
+            self._validate_params(func)
+            self.listening[method][path] = func
+            return func
+
+        return decorator
+
+    def before_handler(self, path: str, priority: int | float):
+        return self._register_hook(self._before_handlers, path, priority)
+
+    def after_handler(self, path: str, priority: int | float):
+        return self._register_hook(self._after_handlers, path, priority)
+
+    def get_method(self, path: str):
+        return self._method('GET', path)
+
+    def post_method(self, path: str):
+        return self._method('POST', path)
+
+    def put_method(self, path: str):
+        return self._method('PUT', path)
+
+    def delete_method(self, path: str):
+        return self._method('DELETE', path)
 
     @staticmethod
     def _validate_params(func):
@@ -40,25 +90,20 @@ class HTTPRouter:
             raise ValueError("Expected true or false")
         return typ(value)
 
-    def _method(self, method: str, path: str):
-        def decorator(func):
-            self._validate_params(func)
-            self.listening[method][path] = func
-            return func
-
-        return decorator
-
-    def get_method(self, path: str):
-        return self._method('GET', path)
-
-    def post_method(self, path: str):
-        return self._method('POST', path)
-
-    def put_method(self, path: str):
-        return self._method('PUT', path)
-
-    def delete_method(self, path: str):
-        return self._method('DELETE', path)
+    @staticmethod
+    def _match_path(pattern_path: str, real_path: str):
+        regex_parts = []
+        for part in pattern_path.strip("/").split("/"):
+            if part.startswith("{") and part.endswith("}"):
+                regex_parts.append(f"(?P<{part[1:-1]}>[^/]+)")
+            elif part == "**":
+                regex_parts.append(".*")
+            elif part == "*":
+                regex_parts.append("[^/]+")
+            else:
+                regex_parts.append(re.escape(part))
+        pattern = "^/" + "/".join(regex_parts) + "/?$"
+        return re.fullmatch(pattern, real_path)
 
     def param_handler(self, request: HTTPRequest, func):
         args = []
@@ -97,7 +142,24 @@ class HTTPRouter:
                     raise BodyParameterError(f"Invalid body parameter: {name}") from e
             else:
                 args.append(None)
-        return func(*args)
+        return args
+
+    def request_handler(self, request: HTTPRequest, func):
+        # 参数绑定成功后才进入钩子；钩子异常交给 HTTPServer 统一处理。
+        real_path = urlsplit(request.path).path
+        for _, path, hook in self._before_handlers:
+            if self._match_path(path, real_path):
+                updated = hook(request)
+                if updated is not None:
+                    request = updated
+        args = self.param_handler(request, func)
+        response = func(*args)
+        for _, path, hook in self._after_handlers:
+            if self._match_path(path, real_path):
+                updated = hook(request, response)
+                if updated is not None:
+                    response = updated
+        return response
 
     def router(self, request: HTTPRequest):
         path = request.path
@@ -120,36 +182,12 @@ class HTTPRouter:
         func = routes.get(real_path)
 
         if func:
-            return self.param_handler(request, func)
+            return self.request_handler(request, func)
         # 3. 动态路由匹配
         for route_path, func in routes.items():
-
-            parts = route_path.strip("/").split("/")
-            regex_parts = []
-
-            for part in parts:
-
-                # /users/{id}
-                if part.startswith("{") and part.endswith("}"):
-                    name = part[1:-1]
-                    regex_parts.append(f"(?P<{name}>[^/]+)")
-
-                # /static/**
-                elif part == "**":
-                    regex_parts.append(".*")
-
-                # /static/*
-                elif part == "*":
-                    regex_parts.append("[^/]+")
-
-                else:
-                    regex_parts.append(re.escape(part))
-
-            pattern = "^/" + "/".join(regex_parts) + "/?$"
-
-            match = re.fullmatch(pattern, real_path)
+            match = self._match_path(route_path, real_path)
 
             if match:
                 request.path_params = match.groupdict()
-                return self.param_handler(request, func)
+                return self.request_handler(request, func)
         raise RouteNotFoundError(f"No route for {method} {real_path}")
