@@ -4,10 +4,11 @@ from HTTP.http_models import Path, Query, Body
 from HTTP.http_module import ServerModule
 from HTTP.http_request import HTTPRequest
 from HTTP.http_response import HTTPResponse
+from HTTP.http_application import HTTPApplication
 from HTTP.http_server import HTTPServer
 from Utils import ContentType
 
-server = HTTPServer()
+app = HTTPApplication()
 
 
 class User:
@@ -31,17 +32,17 @@ class Module1(ServerModule):
         print("module1 func l1 success")
 
 
-@server.router.before_handler("/**", 0)
+@app.router.before_handler("/**", 0)
 def b1(req: HTTPRequest):
     return req
 
 
-@server.router.after_handler("/**", 0)
+@app.router.after_handler("/**", 0)
 def b2(req: HTTPRequest, res: HTTPResponse):
     return res
 
 
-@server.router.get_method("/1/{id}/{uid}")
+@app.router.get_method("/1/{id}/{uid}")
 def f1(
     request: HTTPRequest,
     id: Path[int],
@@ -58,7 +59,7 @@ def f1(
                         content_type=ContentType.HTML)
 
 
-@server.router.post_method("/2/{id}/{uid}")
+@app.router.post_method("/2/{id}/{uid}")
 def t2(request: HTTPRequest, id: Path[int], q1: Query[int], uid: Path[int], user: Body[User]):
     print(id.value)
     print(q1.value)
@@ -69,6 +70,8 @@ def t2(request: HTTPRequest, id: Path[int], q1: Query[int], uid: Path[int], user
 
 
 # request = HTTPRequest("GET", "/1/2/3", "", {}, "")
-# server.router.router(request)
-server.register_module(Module1, 1, 2)
-server.run()
+# app.handle_request(request)
+app.register_module(Module1, 1, 2)
+if __name__ == "__main__":
+    with app.lifecycle():
+        HTTPServer(app).run()

@@ -1,156 +1,74 @@
+import logging
 import math
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from threading import BoundedSemaphore, Event, RLock
+from threading import BoundedSemaphore, Event, Lock
 
-from HTTP import http_router
-from HTTP.http_errors import HTTPError
-from HTTP.http_module import ServerModule
-from HTTP.http_request import HTTPRequest
-from HTTP.http_response import HTTPResponse
-from Utils import ContentType
+from HTTP.http_protocol import HTTPProtocolError, read_http_request
+from HTTP.http_wsgi import WSGIRequestHandler, build_environ
+
+logger = logging.getLogger(__name__)
 
 
 class HTTPServer:
-    def __init__(self, host="127.0.0.1", port=8000, max_workers=8, request_timeout=10.0):
+    """运行任意 WSGI callable 的线程池服务器；每个连接处理一个请求。"""
+
+    def __init__(self, application, host="127.0.0.1", port=8000, max_workers=8,
+                 request_timeout=10.0, max_header_bytes=65536, max_body_bytes=10 * 1024 * 1024):
+        if not callable(application):
+            raise TypeError("application must be a WSGI callable")
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
         if (isinstance(request_timeout, bool) or not isinstance(request_timeout, (int, float))
                 or request_timeout <= 0 or not math.isfinite(request_timeout)):
             raise ValueError("request_timeout must be a finite number > 0")
+        for name, value in (("max_header_bytes", max_header_bytes), ("max_body_bytes", max_body_bytes)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        self.application = application
         self.host = host
         self.port = port
         self.max_workers = max_workers
         self.request_timeout = request_timeout
-        self._modules = {}
-        self._modules_ready = False
-        self._initialized_modules = []
-        self._initialization_started = False
+        self.max_header_bytes = max_header_bytes
+        self.max_body_bytes = max_body_bytes
         self._started = False
-        self._state_lock = RLock()
+        self._state_lock = Lock()
         self._stop_event = Event()
-        self.router = http_router.HTTPRouter(self._resolve_module)
-
-    def register_module(self, module_class, *args, **kwargs):
-        if not isinstance(module_class, type) or not issubclass(module_class, ServerModule):
-            raise TypeError("Module must inherit ServerModule")
-        with self._state_lock:
-            if self._started or self._initialization_started:
-                raise RuntimeError("Modules must be registered before run")
-            if module_class in self._modules:
-                raise ValueError(f"Module already registered: {module_class.__name__}")
-            module = module_class(*args, **kwargs)
-            self._modules[module_class] = module
-            return module
-
-    def get_module(self, module_class):
-        with self._state_lock:
-            return self._modules[module_class]
-
-    def _resolve_module(self, module_class, optional=False):
-        with self._state_lock:
-            if not self._modules_ready:
-                raise RuntimeError("Module injection is only available after server_init")
-            if module_class not in self._modules:
-                if optional:
-                    return None
-                raise RuntimeError(f"Module is not registered: {module_class.__name__}")
-            return self._modules[module_class]
-
-    def _recv_request(self, client: socket.socket) -> bytes:
-        # 可变缓冲区避免每次 recv 都复制已经读取的全部内容。
-        data = bytearray()
-
-        # 读取完整 Header
-        while b"\r\n\r\n" not in data:
-            chunk = client.recv(4096)
-            if not chunk:
-                return b""
-            data.extend(chunk)
-
-        head, _, body = data.partition(b"\r\n\r\n")
-
-        # 获取 Content-Length
-        content_length = next(
-            (
-                int(line.split(b":", 1)[1].strip())
-                for line in head.split(b"\r\n")
-                if line.lower().startswith(b"content-length:")
-            ),
-            0
-        )
-
-        # 继续读取 Body
-        while len(body) < content_length:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            body.extend(chunk)
-
-        return bytes(head + b"\r\n\r\n" + body)
-
-    def error_handler(self, e: Exception) -> HTTPResponse:
-        if isinstance(e, HTTPError):
-            code, status, message = e.code, e.status, str(e)
-        else:
-            print(f"Request error: {e}")
-            code, status, message = 500, "Internal Server Error", "Internal Server Error"
-        return HTTPResponse(
-            body={"error": message},
-            content_type=ContentType.JSON,
-            code=code,
-            status=status
-        )
-
-    def server_init(self):
-        """由 run 管理模块初始化，同一个服务器实例仅初始化一次。"""
-        with self._state_lock:
-            if self._initialization_started:
-                raise RuntimeError("Server modules have already started initialization")
-            self._initialization_started = True
-            modules = tuple(self._modules.values())
-        for module in modules:
-            # 先记录，确保初始化失败时也能释放该模块已创建的部分资源。
-            self._initialized_modules.append(module)
-            module.server_init()
-        with self._state_lock:
-            # 全部模块初始化成功后才允许请求注入，避免使用尚未就绪的资源。
-            self._modules_ready = True
-
-    def _close_modules(self):
-        with self._state_lock:
-            self._modules_ready = False
-        for module in reversed(self._initialized_modules):
-            try:
-                module.server_close()
-            except Exception as e:
-                print(f"Module close error: {e}")
-        self._initialized_modules.clear()
 
     def stop(self):
-        """停止接收新请求；run 等待正在处理的请求结束后释放模块。"""
+        """停止接收连接；run 会等待正在调用、迭代和发送的 WSGI 响应结束。"""
         self._stop_event.set()
 
-    def _handle_client(self, client: socket.socket, address):
-        # 每个连接的读取、Hook、Handler、响应发送均在同一个工作线程中。
+    def _handle_client(self, client, address):
         with client:
             try:
-                try:
-                    raw = self._recv_request(client)
-                except socket.timeout:
-                    response = HTTPResponse(body="Request Timeout", code=408, status="Request Timeout")
-                else:
-                    if not raw:
-                        return
-                    request = HTTPRequest.construct_from_bytes(raw)
-                    response = self.router.router(request)
-                payload = response.response()
-            except Exception as e:
-                payload = self.error_handler(e).response()
-            try:
-                client.sendall(payload)
-            except OSError as e:
-                print(f"Response error for {address}: {e}")
+                request = read_http_request(client, self.request_timeout, self.max_header_bytes, self.max_body_bytes)
+                if request is None:
+                    return
+            except (socket.timeout, HTTPProtocolError) as error:
+                code = 408 if isinstance(error, socket.timeout) else error.code
+                self._send_protocol_error(client, code)
+                return
+            except OSError:
+                return
+            environ = build_environ(request, address, self.host, self.port)
+            # Server 仅调用标准接口，不能假设应用具有 router、startup 等框架方法。
+            handler = WSGIRequestHandler(client, environ, multithread=self.max_workers > 1)
+            handler.run(self.application)
+
+    @staticmethod
+    def _send_protocol_error(client, code):
+        from http import HTTPStatus
+
+        status = HTTPStatus(code).phrase
+        body = status.encode("ascii")
+        payload = (f"HTTP/1.1 {code} {status}\r\nConnection: close\r\n"
+                   f"Content-Type: text/plain; charset=utf-8\r\nContent-Length: {len(body)}\r\n\r\n").encode("ascii") + body
+        try:
+            client.sendall(payload)
+        except OSError:
+            pass
 
     def run(self):
         with self._state_lock:
@@ -163,43 +81,37 @@ class HTTPServer:
             slots.release()
             error = future.exception()
             if error is not None:
-                print(f"Client worker error: {error}")
+                logger.error("Client worker failed", exc_info=(type(error), error, error.__traceback__))
 
-        try:
-            self.router.freeze(self._modules)
-            self.server_init()
-            with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="http") as executor:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    server.bind((self.host, self.port))
-                    server.listen(self.max_workers)
-                    server.settimeout(0.2)
-                    self.port = server.getsockname()[1]
-                    print(f"Server running: http://{self.host}:{self.port}")
-                    while not self._stop_event.is_set():
-                        # ponytail: 不向线程池无限排队；最多 max_workers 个在途连接。
-                        if not slots.acquire(timeout=0.2):
-                            continue
-                        try:
-                            client, address = server.accept()
-                        except socket.timeout:
-                            slots.release()
-                            continue
-                        except BaseException:
-                            slots.release()
-                            raise
-                        try:
-                            if self._stop_event.is_set():
-                                client.close()
-                                slots.release()
-                                break
-                            client.settimeout(self.request_timeout)
-                            future = executor.submit(self._handle_client, client, address)
-                        except BaseException:
+        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="http") as executor:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((self.host, self.port))
+                server.listen(self.max_workers)
+                server.settimeout(0.2)
+                self.port = server.getsockname()[1]
+                print(f"Server running: http://{self.host}:{self.port}")
+                while not self._stop_event.is_set():
+                    # ponytail: 不向线程池无限排队；最多 max_workers 个在途连接。
+                    if not slots.acquire(timeout=0.2):
+                        continue
+                    try:
+                        client, address = server.accept()
+                    except socket.timeout:
+                        slots.release()
+                        continue
+                    except BaseException:
+                        slots.release()
+                        raise
+                    try:
+                        if self._stop_event.is_set():
                             client.close()
                             slots.release()
-                            raise
-                        future.add_done_callback(client_done)
-        finally:
-            # 退出线程池会等待请求完成，再释放请求可能仍在使用的模块资源。
-            self._close_modules()
+                            break
+                        client.settimeout(self.request_timeout)
+                        future = executor.submit(self._handle_client, client, address)
+                    except BaseException:
+                        client.close()
+                        slots.release()
+                        raise
+                    future.add_done_callback(client_done)

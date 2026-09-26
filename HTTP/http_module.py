@@ -2,11 +2,11 @@ from abc import ABC, abstractmethod
 
 
 class ServerModule(ABC):
-    """每个服务器保存一个模块实例；模块资源需要支持并发请求。"""
+    """每个 Application 实例保存一个模块；资源必须支持并发请求。"""
 
     @abstractmethod
     def server_init(self):
-        """服务器开始监听前初始化资源。"""
+        """Application 启动时初始化；保留旧方法名方便已有模块迁移。"""
         pass
 
     def server_close(self):

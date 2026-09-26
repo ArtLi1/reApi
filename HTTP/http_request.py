@@ -1,4 +1,6 @@
 import json
+import re
+from urllib.parse import quote, unquote, urlsplit
 
 from HTTP.http_errors import BodyParameterError
 from Utils import parse_url_parameters
@@ -15,6 +17,13 @@ class HTTPRequest:
     ):
         self.method = method
         self.path = path
+        url = urlsplit(path)
+        # 框架匹配已解码的路径，Path 参数不再二次解码；与标准 WSGI 入口一致。
+        self.path_info = unquote(url.path)
+        self.query_string = url.query
+        self.script_name = ""
+        self.scheme = "http"
+        self.environ = None
         self.version = version
         # HTTP Header 名称不区分大小写，统一转小写方便查找
         self.headers = {
@@ -106,6 +115,40 @@ class HTTPRequest:
     @property
     def text(self) -> str:
         return self.raw_body.decode("utf-8")
+
+    @classmethod
+    def from_environ(cls, environ):
+        """仅读取声明长度，不关闭由 WSGI Server 提供的输入流。"""
+        length_text = environ.get("CONTENT_LENGTH", "") or "0"
+        if not re.fullmatch(r"[0-9]+", length_text):
+            raise BodyParameterError("Invalid Content-Length")
+        try:
+            length = int(length_text)
+        except ValueError as error:
+            raise BodyParameterError("Invalid Content-Length") from error
+        body = bytearray()
+        while len(body) < length:
+            chunk = environ["wsgi.input"].read(length - len(body))
+            if not chunk:
+                raise BodyParameterError("Incomplete request body")
+            body.extend(chunk)
+        headers = {
+            name[5:].replace("_", "-").lower(): value
+            for name, value in environ.items()
+            if name.startswith("HTTP_") and name not in ("HTTP_CONTENT_TYPE", "HTTP_CONTENT_LENGTH")
+        }
+        for name in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+            if environ.get(name) is not None:
+                headers[name.replace("_", "-").lower()] = environ[name]
+        # PEP 3333 的路径字符串用 Latin-1 承载原始字节；URL 路径按 UTF-8 解释。
+        path_info = environ.get("PATH_INFO", "").encode("iso-8859-1").decode("utf-8", "replace")
+        query = environ.get("QUERY_STRING", "")
+        target = quote(path_info or "/", safe="/") + ("?" + query if query else "")
+        request = cls(environ["REQUEST_METHOD"], target, environ.get("SERVER_PROTOCOL", "HTTP/1.1"), headers, bytes(body))
+        request.script_name = environ.get("SCRIPT_NAME", "").encode("iso-8859-1").decode("utf-8", "replace")
+        request.scheme = environ.get("wsgi.url_scheme", "http")
+        request.environ = environ
+        return request
 
     @classmethod
     def construct_from_bytes(cls, request: bytes):
