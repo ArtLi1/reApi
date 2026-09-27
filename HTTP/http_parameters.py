@@ -1,6 +1,10 @@
+import json
+from dataclasses import is_dataclass
 from inspect import signature
 from types import UnionType
-from typing import Union, get_args, get_origin, get_type_hints
+from typing import Any, Union, get_args, get_origin, get_type_hints
+
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
 
 from HTTP.http_errors import BodyParameterError, PathParameterError, QueryParameterError
 from HTTP.http_models import Body, Path, Query
@@ -14,7 +18,42 @@ class ParameterBinder:
 
     def __init__(self, module_resolver=None):
         self.parameters = {}
+        self._body_models = {}
         self._module_resolver = module_resolver
+
+    def _compile_body_model(self, model):
+        if model in self._body_models:
+            return
+        if issubclass(model, BaseModel) or is_dataclass(model):
+            adapter, constructor = TypeAdapter(model), None
+        else:
+            # 兼容普通构造类：根据构造参数生成校验模型；未注解参数保留 Any。
+            hints = get_type_hints(model.__init__, include_extras=True)
+            class_hints = get_type_hints(model, include_extras=True)
+            fields = {}
+            parameters = {} if model.__init__ is object.__init__ else signature(model).parameters
+            for name, param in parameters.items():
+                if param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
+                    raise TypeError(f"Body model {model.__name__}.{name} must be a named parameter")
+                if name.startswith("_"):
+                    raise TypeError(f"Body model {model.__name__}.{name} must be a public field")
+                fields[name] = (hints.get(name, class_hints.get(name, Any)),
+                                ... if param.default is param.empty else param.default)
+            schema = create_model(f"{model.__name__}Body", __config__=ConfigDict(validate_default=True), **fields)
+            adapter, constructor = TypeAdapter(schema), model
+        # 注册时构建并缓存，Handler / Hook 请求阶段只执行校验和对象构造。
+        adapter.rebuild(raise_errors=True)
+        self._body_models[model] = adapter, constructor
+
+    def _parse_body_model(self, model, data):
+        adapter, constructor = self._body_models[model]
+        # 使用 JSON 校验入口，严格模式仍可从 JSON 对象构造嵌套 dataclass。
+        # 使用当前 json，保证 before 对数据的修改会参与校验。
+        encoded = json.dumps(data, ensure_ascii=False, allow_nan=False)
+        value = adapter.validate_json(encoded, strict=True, extra="forbid")
+        if constructor is None:
+            return value
+        return constructor(**{name: getattr(value, name) for name in type(value).model_fields})
 
     @staticmethod
     def _is_module(annotation):
@@ -36,7 +75,7 @@ class ParameterBinder:
             if param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
                 raise TypeError(f"{func.__name__}.{name} must be a named parameter")
             declared = hints.get(name, param.annotation)
-            annotation, _ = self._unwrap_optional(declared)
+            annotation, optional = self._unwrap_optional(declared)
             kind = get_origin(annotation) or annotation
             if annotation is HTTPRequest or self._is_module(annotation):
                 pass
@@ -52,8 +91,16 @@ class ParameterBinder:
                 args = get_args(annotation)
                 if len(args) != 1 or not isinstance(args[0], type):
                     raise TypeError(f"{func.__name__}.{name} must be Body[ModelClass]")
+                self._compile_body_model(args[0])
             else:
                 raise TypeError(f"Unsupported annotation for {func.__name__}.{name}: {annotation}")
+            if not optional and param.default is not param.empty and kind in (Path, Query, Body):
+                if not isinstance(param.default, kind):
+                    raise TypeError(f"{func.__name__}.{name} default must be a {kind.__name__} value")
+                typ = get_args(annotation)[0]
+                valid = isinstance(param.default.value, typ) if kind is Body else type(param.default.value) is typ
+                if not valid:
+                    raise TypeError(f"{func.__name__}.{name} default does not match its annotation")
             parameters[name] = param.replace(annotation=declared)
         return parameters
 
@@ -100,31 +147,38 @@ class ParameterBinder:
                         continue
                     if is_path:
                         raise RuntimeError(f"{func.__name__}.{name} is not available in this route")
-                    raise QueryParameterError(f"Missing query parameter: {name}")
+                    raise QueryParameterError(f"Missing query parameter: {name}",
+                                              location=(label, name), error_type="missing")
                 try:
                     # 路径和 Query 已在请求构造时解码，此处只进行类型转换。
                     value = values[name]
                     args[name] = annotation(self._parse_basic(value, get_args(annotation)[0]))
                 except (TypeError, ValueError) as e:
-                    raise error(f"Invalid {label} parameter: {name}") from e
+                    raise error(f"Invalid {label} parameter: {name}",
+                                location=(label, name), error_type="invalid_type") from e
             elif kind is Body:
                 # 缺失请求体可省略；显式 JSON null 或非法内容仍需报错。
-                if optional and not request.raw_body and request.json is None:
+                missing = not request.raw_body and request.json is None
+                if optional and missing:
                     args[name] = None
                     continue
-                if not optional and not request.raw_body and param.default is not param.empty:
+                if missing and param.default is not param.empty:
                     continue
+                if missing:
+                    raise BodyParameterError("Missing JSON body", error_type="missing")
                 # Body[T] 只绑定 JSON 对象；其他请求体格式仍可由 HTTPRequest 单独使用。
                 if request.media_type != "application/json":
-                    raise BodyParameterError("Body requires application/json")
-                if request.json is None:
-                    raise BodyParameterError("Missing JSON body")
+                    raise BodyParameterError("Body requires application/json", error_type="invalid_media_type")
                 if not isinstance(request.json, dict):
-                    raise BodyParameterError("JSON body must be an object")
+                    raise BodyParameterError("JSON body must be an object", error_type="invalid_type")
                 try:
                     # 各函数分别构造模型，构造函数应只解析数据，不执行数据库等业务操作。
-                    args[name] = annotation(get_args(annotation)[0](**request.json))
+                    args[name] = annotation(self._parse_body_model(get_args(annotation)[0], request.json))
+                except ValidationError as e:
+                    errors = [{"location": ["body", *item["loc"]], "message": item["msg"], "type": item["type"]}
+                              for item in e.errors(include_input=False, include_context=False, include_url=False)]
+                    raise BodyParameterError("JSON body validation failed", errors=errors) from e
                 except (TypeError, ValueError) as e:
-                    raise BodyParameterError(f"Invalid body parameter: {name}") from e
+                    raise BodyParameterError(f"Invalid body parameter: {name}", error_type="invalid_value") from e
         return args
 

@@ -1,8 +1,9 @@
 import logging
 from contextlib import contextmanager
+from inspect import iscoroutinefunction, signature
 from threading import RLock
 
-from HTTP.http_errors import HTTPError
+from HTTP.http_errors import HTTPError, ParameterValidationError
 from HTTP.http_module import ServerModule
 from HTTP.http_parameters import ParameterBinder
 from HTTP.http_request import HTTPRequest
@@ -21,6 +22,7 @@ class HTTPApplication:
         self._modules_ready = False
         self._initialized_modules = []
         self._initialization_started = False
+        self._exception_handlers = {}
         self._state_lock = RLock()
         self.binder = ParameterBinder(self._resolve_module)
         self.router = HTTPRouter(self.binder)
@@ -51,14 +53,56 @@ class HTTPApplication:
                 raise RuntimeError(f"Module is not registered: {module_class.__name__}")
             return self._modules[module_class]
 
-    def error_handler(self, e: Exception) -> HTTPResponse:
+    def add_exception_handler(self, exception_class, handler):
+        """注册同步回调 handler(request, error)；请求构造失败时 request 为 None。"""
+        if not isinstance(exception_class, type) or not issubclass(exception_class, Exception):
+            raise TypeError("Exception handler key must be an Exception subclass")
+        if (not callable(handler) or iscoroutinefunction(handler)
+                or iscoroutinefunction(getattr(handler, "__call__", None))):
+            raise TypeError("Exception handler must be a synchronous callable")
+        signature(handler).bind(None, Exception())
+        with self._state_lock:
+            if self._initialization_started:
+                raise RuntimeError("Exception handlers must be registered before application startup")
+            if exception_class in self._exception_handlers:
+                raise ValueError(f"Exception handler already registered: {exception_class.__name__}")
+            self._exception_handlers[exception_class] = handler
+
+    def exception_handler(self, exception_class):
+        def decorator(handler):
+            self.add_exception_handler(exception_class, handler)
+            return handler
+        return decorator
+
+    def error_handler(self, e: Exception, request=None) -> HTTPResponse:
+        if not isinstance(e, HTTPError):
+            logger.error("Request failed", exc_info=(type(e), e, e.__traceback__))
+        # 按 MRO 选择最具体的已注册类型，注册先后不影响优先级。
+        handler = next((self._exception_handlers[cls] for cls in type(e).__mro__
+                        if cls in self._exception_handlers), None)
+        if handler is not None:
+            try:
+                response = handler(request, e)
+                if not isinstance(response, HTTPResponse):
+                    raise TypeError("Exception handlers must return HTTPResponse")
+                # 在返回前检查响应，避免错误处理器的错误再次进入同一个处理器。
+                response.to_wsgi()
+                return response
+            except Exception:
+                logger.exception("Exception handler failed")
+                e = RuntimeError("Exception handler failed")
         if isinstance(e, HTTPError):
             code, status, message = e.code, e.status, str(e)
+            error_code = e.error_code
         else:
-            logger.error("Request failed", exc_info=(type(e), e, e.__traceback__))
             code, status, message = 500, "Internal Server Error", "Internal Server Error"
+            error_code = "internal_server_error"
+        # error 保留旧接口兼容；code/message/errors 是新的稳定错误结构。
+        payload = {"code": error_code, "message": message, "error": message}
+        if isinstance(e, ParameterValidationError):
+            payload["errors"] = e.errors
         return HTTPResponse(
-            body={"error": message},
+            body=payload,
             content_type=ContentType.JSON,
             code=code,
             status=status,
@@ -113,17 +157,19 @@ class HTTPApplication:
         try:
             return self.dispatch_request(request)
         except Exception as error:
-            return self.error_handler(error)
+            return self.error_handler(error, request)
 
     def __call__(self, environ, start_response):
         # 包含请求构造和响应转换，保证非法 JSON 与 Handler 异常使用同一错误格式。
+        request = None
         try:
             if not self._modules_ready:
                 raise RuntimeError("Use application.lifecycle() or startup() before serving")
-            response = self.handle_request(HTTPRequest.from_environ(environ))
+            request = HTTPRequest.from_environ(environ)
+            response = self.handle_request(request)
             status, headers, body = response.to_wsgi()
         except Exception as error:
-            status, headers, body = self.error_handler(error).to_wsgi()
+            status, headers, body = self.error_handler(error, request).to_wsgi()
         # start_response 的服务器异常不能再次包装成另一份响应。
         start_response(status, headers)
         # Application 负责 HEAD 语义，换用外部 WSGI Server 也不会发送正文。

@@ -1,10 +1,12 @@
 # httpDemo
 
-轻量同步 Python Web 框架及线程池 WSGI Server，Python 3.10+，仅使用标准库。
+轻量同步 Python Web 框架及线程池 WSGI Server，Python 3.10+。
+网络与 WSGI 层使用标准库，Body 模型校验使用 Pydantic 2。
 
 ## 启动示例
 
 ```bash
+python -m pip install -r requirements.txt
 python main.py
 python main.py --server wsgiref
 ```
@@ -130,12 +132,91 @@ HEAD 的 Hook 处理完整 Response；Application 在 WSGI 输出时去掉正文
 - `HTTPRequest`、模块类型：Handler、before、after 均可注入。
 - `HTTPResponse`：仅 after 可注入；多个 after 收到最新响应。
 - `Path[T]` / `Query[T]`：T 为 str、int、float、bool；包装值通过 `.value` 获取。
-- `Body[Model]`：仅 JSON 对象，以 `Model(**json)` 构造；普通模型注解不会自动验证字段类型。
+- `Body[Model]`：仅 JSON 对象，按模型类型严格校验；支持 Pydantic BaseModel、dataclass
+  和具有命名构造参数的普通类。未知字段返回 400。
 - `T | None` / `Optional[T]`：缺失时注入 None，有值时正常校验，非法值仍报错。
 - Hook 路径只支持完整的 `*` / `**` 通配段；优先级越小越先执行，相同值按注册顺序。
 - 流程：匹配路由 → before → Handler 与 after 参数预校验 → Handler → after。
 - before 可修改 query、path_params、json；不能改变已经匹配的请求方法或路径。
 - after 仅在 Handler 成功返回后执行；Body 模型构造函数应只处理数据。
+
+### Body 模型校验
+
+```python
+from pydantic import BaseModel, ConfigDict, Field
+from HTTP import Body, HTTPResponse
+
+class CreateUser(BaseModel):
+    model_config = ConfigDict(validate_default=True)
+    name: str = Field(min_length=1)
+    age: int = Field(ge=0)
+    note: str | None = None
+
+@app.router.post_method("/users")
+def create_user(data: Body[CreateUser]):
+    return HTTPResponse(f"{data.value.name}:{data.value.age}")
+```
+
+Body 统一采用 Pydantic JSON 严格校验，`{"age":"18"}` 不会自动转成整数；
+支持嵌套模型、列表元素、字段约束和自定义校验器。校验器在注册时创建并复用。
+Pydantic 的 JSON 严格模式仍允许 JSON 中常规的日期字符串表示等类型转换，
+具体规则见 [Pydantic 严格模式](https://docs.pydantic.dev/latest/concepts/strict_mode/)。
+
+普通类优先采用 `__init__` 参数注解，其次采用同名类字段注解，再调用构造函数。
+未注解字段按 Any 处理以兼容旧代码；需要完整字段校验时，应补齐类型或使用 BaseModel / dataclass。
+普通类构造参数必须为公开字段，不能使用下划线开头的名称、位置专用参数、`*args` 或 `**kwargs`。
+模型字段默认值由模型声明负责；BaseModel 可开启 `validate_default=True` 校验默认值。
+
+| 参数情况 | 行为 |
+|---|---|
+| `T \| None` 缺失 | 注入 None，即使函数声明了其他默认值 |
+| 必填参数缺失、无默认值 | 返回 400；Hook 依赖不存在的 Path 属于配置错误，返回 500 |
+| 非可选参数缺失、有默认值 | 使用函数声明的默认值 |
+| Query `text=` | 视为存在，str 得到空字符串，其他类型按转换结果校验 |
+| 重复 Query 键 | 基本类型不能接收多个值，返回 400 |
+| Body 为 JSON null、数组或标量 | 返回 400，Optional Body 也要求存在时为 JSON 对象 |
+| 非空 Body 不是 application/json | 返回 400 |
+| 非法 JSON、NaN / Infinity | 返回 400 |
+
+非可选 Path / Query / Body 的函数默认值必须使用对应包装类，且值与声明类型匹配，
+例如 `count: Query[int] = Query(10)`；不匹配会在注册时失败。
+缺失与非法输入的规则在 Handler、before、after 中一致。
+
+### 错误响应与异常处理器
+
+框架错误使用稳定的字符串 code 与 message；参数错误额外包含字段位置、消息和类型：
+
+```json
+{
+  "code": "validation_error",
+  "message": "JSON body validation failed",
+  "error": "JSON body validation failed",
+  "errors": [
+    {"location": ["body", "age"], "message": "Input should be a valid integer", "type": "int_type"}
+  ]
+}
+```
+
+`error` 保留旧响应字段兼容。Body 的嵌套字段和列表下标会出现在 location 中，
+Query / Path 分别使用 `["query", 参数名]` 和 `["path", 参数名]`。
+响应不附带原始输入、Pydantic 上下文或内部异常堆栈。HTTP 状态仍使用 400。
+
+```python
+from HTTP import QueryParameterError, HTTPResponse
+
+@app.exception_handler(QueryParameterError)
+def query_error(request, error):
+    return HTTPResponse("Query 参数不合法", code=400, status="Bad Request")
+```
+
+也可调用 `app.add_exception_handler(ExceptionType, handler)`。
+处理器签名为 `handler(request, error)`，必须同步返回 HTTPResponse；
+请求构造失败时 request 为 None。匹配异常类型的 MRO，具体子类处理器优先。
+注册必须在应用启动前完成，相同异常类型不能重复注册。
+
+自定义处理器可覆盖默认状态、响应体及响应头；处理器抛异常、返回错误类型或生成非法响应时，
+记录堆栈并回退到统一 500，不递归调用处理器。未知异常记录堆栈，默认响应仅包含
+`internal_server_error` 与 `Internal Server Error`，不暴露内部异常内容。
 
 ## 协议范围
 
@@ -163,9 +244,5 @@ Path 不会二次解码。`SCRIPT_NAME` 是挂载前缀，路由匹配 `PATH_INF
 `app.router`、`app.register_module()`、`app.get_module()`；Server 构造时传入 WSGI callable。
 启动入口显式包裹 `app.lifecycle()`，不会由 Server 猜测应用生命周期。
 
-```bash
-python -m test.run_checks
-```
-
-测试保存在 `test/` 并纳入版本管理，包括两端互操作、wsgiref.validate、并发请求、
-模块回滚与关闭、Hook 顺序、可选参数、响应迭代和协议边界。
+验证脚本统一放在 `test/`，使用完毕后删除。本阶段验证覆盖严格模型校验、结构化错误、
+可选参数与默认值、Hook 参数、异常处理器失败回退，以及两种 WSGI Server 的响应一致性。

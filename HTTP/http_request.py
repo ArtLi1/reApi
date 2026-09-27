@@ -6,6 +6,11 @@ from HTTP.http_errors import BodyParameterError
 from Utils import parse_url_parameters
 
 
+def _reject_json_constant(value):
+    # Python 的 JSON 解码器默认接受 NaN/Infinity，JSON 请求禁止这些非标准数值。
+    raise ValueError("Non-finite JSON number")
+
+
 class HTTPRequest:
     def __init__(
         self,
@@ -52,9 +57,9 @@ class HTTPRequest:
         # application/json
         if media_type == "application/json":
             try:
-                self.json = json.loads(self.raw_body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                raise BodyParameterError("Invalid JSON body") from e
+                self.json = json.loads(self.raw_body.decode("utf-8"), parse_constant=_reject_json_constant)
+            except (UnicodeDecodeError, ValueError) as e:
+                raise BodyParameterError("Invalid JSON body", error_type="invalid_json") from e
 
         # application/x-www-form-urlencoded
         elif media_type == "application/x-www-form-urlencoded":
