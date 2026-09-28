@@ -58,6 +58,9 @@ class HTTPResponse:
                    if name.lower() != "content-length"]
         no_body = 100 <= self.code < 200 or self.code in (204, 304)
         body = b"" if no_body else self.body
+        if self.code in (204, 304):
+            # 无表示内容的状态不能附带默认 Content-Type（wsgiref.validate 会拒绝）。
+            headers = [(name, value) for name, value in headers if name.lower() != "content-type"]
         if not no_body:
             headers.append(("Content-Length", str(len(body))))
         validate_response(status, headers)

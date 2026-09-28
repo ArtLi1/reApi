@@ -224,10 +224,7 @@ class HTTPRouter:
 
     @staticmethod
     def _automatic_options(request):
-        response = HTTPResponse(code=204, status="No Content", headers={"Allow": ", ".join(request.allowed_methods)})
-        # 能力响应没有表示内容，不携带默认正文类型；兼容 wsgiref.validate。
-        del response.headers["Content-Type"]
-        return response
+        return HTTPResponse(code=204, status="No Content", headers={"Allow": ", ".join(request.allowed_methods)})
 
     def match(self, request: HTTPRequest):
         method, real_path = request.method.upper(), request.path_info

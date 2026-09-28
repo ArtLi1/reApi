@@ -1,5 +1,6 @@
 import json
 import re
+from types import SimpleNamespace
 from urllib.parse import quote, unquote, urlsplit
 
 from HTTP.http_errors import BodyParameterError
@@ -18,7 +19,9 @@ class HTTPRequest:
         path: str,
         version: str,
         headers: dict[str, str],
-        body: bytes = b""
+        body: bytes = b"",
+        *,
+        parse_body: bool = True,
     ):
         self.method = method
         self.path = path
@@ -41,7 +44,11 @@ class HTTPRequest:
         self.files = {}
         self.query = {}
         self.path_params = {}
-        self._parse_body()
+        # 请求独享的状态，供 Middleware、Hook 与 Handler 传递临时数据。
+        self.state = SimpleNamespace()
+        self._body_parsed = parse_body
+        if parse_body:
+            self._parse_body()
 
     @property
     def media_type(self) -> str:
@@ -122,7 +129,7 @@ class HTTPRequest:
         return self.raw_body.decode("utf-8")
 
     @classmethod
-    def from_environ(cls, environ):
+    def from_environ(cls, environ, *, parse_body=True):
         """仅读取声明长度，不关闭由 WSGI Server 提供的输入流。"""
         length_text = environ.get("CONTENT_LENGTH", "") or "0"
         if not re.fullmatch(r"[0-9]+", length_text):
@@ -149,7 +156,8 @@ class HTTPRequest:
         path_info = environ.get("PATH_INFO", "").encode("iso-8859-1").decode("utf-8", "replace")
         query = environ.get("QUERY_STRING", "")
         target = quote(path_info or "/", safe="/") + ("?" + query if query else "")
-        request = cls(environ["REQUEST_METHOD"], target, environ.get("SERVER_PROTOCOL", "HTTP/1.1"), headers, bytes(body))
+        request = cls(environ["REQUEST_METHOD"], target, environ.get("SERVER_PROTOCOL", "HTTP/1.1"),
+                      headers, bytes(body), parse_body=parse_body)
         request.script_name = environ.get("SCRIPT_NAME", "").encode("iso-8859-1").decode("utf-8", "replace")
         request.scheme = environ.get("wsgi.url_scheme", "http")
         request.environ = environ

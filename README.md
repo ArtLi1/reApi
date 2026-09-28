@@ -59,7 +59,7 @@ Server 只调用 WSGI 接口，包装后的中间件无需暴露路由或模块�
 | `http_protocol` | HTTP 报文边界、长度校验、读取期限与大小限制 |
 | `http_server` | Socket、线程池、背压、等待请求排空 |
 | `http_wsgi` | environ、start_response、字节迭代、发送与关闭 |
-| `http_application` | 模块、应用生命周期、请求流程、框架异常响应 |
+| `http_application` | 模块、应用生命周期、Middleware、请求流程、框架异常响应及访问日志 |
 | `http_router` | 路由与 Hook 注册、路径匹配 |
 | `http_parameters` | 声明检查与统一参数绑定 |
 | `http_request` / `http_response` | 框架请求、响应数据与 WSGI 转换 |
@@ -72,7 +72,59 @@ Server 只调用 WSGI 接口，包装后的中间件无需暴露路由或模块�
 Application 管理，按注册类注入同一个实例。共享模块需要支持并发访问。
 
 `app.dispatch_request(request)` 保留异常，便于针对内部行为测试；
-`app.handle_request(request)` 将处理异常转为响应。WSGI 入口还覆盖请求构造时的错误。
+`app.handle_request(request)` 执行 Middleware 并将处理异常转为响应。
+WSGI 入口还覆盖请求构造时的错误。
+
+## Middleware 与请求状态
+
+```python
+from time import monotonic
+from uuid import uuid4
+from HTTP import HTTPRequest
+
+@app.middleware
+def trace(request: HTTPRequest, call_next):
+    request.state.request_id = uuid4().hex
+    started = monotonic()
+    response = call_next()
+    response.headers["X-Request-ID"] = request.state.request_id
+    response.headers["Server-Timing"] = f"app;dur={(monotonic() - started) * 1000:.2f}"
+    return response
+```
+
+也可调用 `app.add_middleware(trace)`。Middleware 签名固定为
+`(request, call_next)`，同步执行，必须返回 HTTPResponse；不使用 Handler 的参数注入。
+`call_next()` 不接收参数，只能在当前 Middleware 调用期间执行一次；可不调用，
+直接返回 Response 以短路。首次注册的 Middleware 位于最外层，应用启动后不能再注册。
+
+`request.state` 是每个请求独有的命名空间，可由 Middleware、before / after Hook、Handler
+通过 HTTPRequest 共享；before 返回替代请求对象时继续沿用同一个 state。
+它不会通过全局变量在线程间共享。`request_id` 由示例 Middleware 创建，框架不强制生成。
+
+执行顺序：
+
+```text
+Middleware 进入 → 内层 Middleware 进入 → 解析 Body → 路由匹配
+→ before → Handler / after 参数预校验 → Handler → after
+→ 内层 Middleware 返回 → 外层 Middleware 返回 → WSGI 响应发送和关闭
+```
+
+路由、参数或 Handler 错误会先转成 Response，外层 Middleware 可观察并修改 404、400、500 等结果。
+自动 OPTIONS、404 和 405 也会经过 Middleware；before / after 仍只处理匹配的业务路由。
+Application 的 WSGI 入口在 Middleware 进入后解析 JSON，因此非法 JSON 返回的 400
+也可被 Middleware 处理。直接创建 HTTPRequest 或直接调用其 `from_environ()` 时，
+默认仍立即解析 Body；WSGI 的 Content-Length、输入流读取及请求对象创建失败发生在
+Middleware 进入前，可交给已注册的异常处理器，此时 request 为 None。
+
+Middleware 的计时在 `call_next()` 返回时结束，表示**应用处理耗时**，此时尚未保证
+响应内容发送完毕。Application 的 INFO 访问日志在 WSGI 迭代器耗尽时记录 `completed`，
+提前关闭（包括连接断开）时记录 `closed`，`start_response` 失败时记录 `start_failed`。
+日志包含方法、路径、应用生成的状态码、从进入 Application 到该时间点的总耗时，
+以及 request.state.request_id（若设置）。连接层在调用 Application 前拒绝的报文
+由 Server 处理。两种 WSGI Server 都会关闭应用响应迭代器。
+
+请求的实际响应体最终由 HTTPResponse 在 WSGI 边界校验和序列化；
+Middleware 对响应头和 Body 的修改在这里生效。204 / 304 输出时会移除默认 Content-Type。
 
 ## 路由注册与分组
 

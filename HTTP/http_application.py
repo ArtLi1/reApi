@@ -2,6 +2,7 @@ import logging
 from contextlib import contextmanager
 from inspect import iscoroutinefunction, signature
 from threading import RLock
+from time import monotonic
 
 from HTTP.http_errors import HTTPError, ParameterValidationError
 from HTTP.http_module import ServerModule
@@ -14,6 +15,36 @@ from Utils import ContentType
 logger = logging.getLogger(__name__)
 
 
+class _ResponseBody:
+    """WSGI 响应迭代器；迭代完毕和提前关闭都只记录一次。"""
+
+    def __init__(self, body, on_finish):
+        self._body = body
+        self._on_finish = on_finish
+        self._sent = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._on_finish is None:
+            raise StopIteration
+        if self._sent:
+            self._finish("completed")
+            raise StopIteration
+        self._sent = True
+        return self._body
+
+    def close(self):
+        self._finish("closed")
+
+    def _finish(self, outcome):
+        callback, self._on_finish = self._on_finish, None
+        self._body = b""
+        if callback is not None:
+            callback(outcome)
+
+
 class HTTPApplication:
     """可交给任意 WSGI Server 的应用；应用资源不依赖 Socket 服务器。"""
 
@@ -23,6 +54,7 @@ class HTTPApplication:
         self._initialized_modules = []
         self._initialization_started = False
         self._exception_handlers = {}
+        self._middlewares = []
         self._state_lock = RLock()
         self.binder = ParameterBinder(self._resolve_module)
         self.router = HTTPRouter(self.binder)
@@ -73,6 +105,22 @@ class HTTPApplication:
             self.add_exception_handler(exception_class, handler)
             return handler
         return decorator
+
+    def add_middleware(self, middleware):
+        """注册同步 middleware(request, call_next)；第一个注册的最外层执行。"""
+        if (not callable(middleware) or iscoroutinefunction(middleware)
+                or iscoroutinefunction(getattr(middleware, "__call__", None))):
+            raise TypeError("Middleware must be a synchronous callable")
+        signature(middleware).bind(None, lambda: None)
+        with self._state_lock:
+            if self._initialization_started:
+                raise RuntimeError("Middleware must be registered before application startup")
+            self._middlewares.append(middleware)
+        return middleware
+
+    def middleware(self, middleware):
+        """允许直接使用 @app.middleware 注册。"""
+        return self.add_middleware(middleware)
 
     def error_handler(self, e: Exception, request=None) -> HTTPResponse:
         if not isinstance(e, HTTPError):
@@ -154,27 +202,72 @@ class HTTPApplication:
         return self._execute(request, func)
 
     def handle_request(self, request: HTTPRequest):
-        try:
-            return self.dispatch_request(request)
-        except Exception as error:
-            return self.error_handler(error, request)
+        def run(index):
+            try:
+                if index == len(self._middlewares):
+                    # WSGI 请求延迟解析 Body，非法 JSON 也会经过 Middleware。
+                    if not request._body_parsed:
+                        request._parse_body()
+                        request._body_parsed = True
+                    response = self.dispatch_request(request)
+                else:
+                    called = False
+                    active = True
+
+                    def call_next():
+                        nonlocal called
+                        if not active:
+                            raise RuntimeError("call_next() is only valid while Middleware is running")
+                        if called:
+                            raise RuntimeError("call_next() may only be called once")
+                        called = True
+                        return run(index + 1)
+
+                    try:
+                        response = self._middlewares[index](request, call_next)
+                    finally:
+                        active = False
+                if not isinstance(response, HTTPResponse):
+                    raise TypeError("Middleware must return HTTPResponse")
+                # 在每一层检查输出，外层 Middleware 才能看见无效响应转换成的 500。
+                response.to_wsgi()
+                return response
+            except Exception as error:
+                # 每一层都把下游错误转为 Response，外层 Middleware 可统一处理 4xx/5xx。
+                return self.error_handler(error, request)
+
+        return run(0)
 
     def __call__(self, environ, start_response):
         # 包含请求构造和响应转换，保证非法 JSON 与 Handler 异常使用同一错误格式。
+        started = monotonic()
         request = None
         try:
             if not self._modules_ready:
                 raise RuntimeError("Use application.lifecycle() or startup() before serving")
-            request = HTTPRequest.from_environ(environ)
+            request = HTTPRequest.from_environ(environ, parse_body=False)
             response = self.handle_request(request)
             status, headers, body = response.to_wsgi()
         except Exception as error:
             status, headers, body = self.error_handler(error, request).to_wsgi()
         # start_response 的服务器异常不能再次包装成另一份响应。
-        start_response(status, headers)
+        method = environ.get("REQUEST_METHOD", "")
+        path = environ.get("PATH_INFO", "")
+        request_id = getattr(request.state, "request_id", None) if request is not None else None
+
+        def finished(outcome):
+            logger.info("HTTP %r %r %s %.2fms request_id=%r outcome=%s",
+                        method, path, status.split(" ", 1)[0], (monotonic() - started) * 1000,
+                        request_id, outcome)
+
+        try:
+            start_response(status, headers)
+        except BaseException:
+            finished("start_failed")
+            raise
         # Application 负责 HEAD 语义，换用外部 WSGI Server 也不会发送正文。
         # Content-Length 保留正常响应长度，after 仍处理完整 Response。
-        return [b"" if environ.get("REQUEST_METHOD", "").upper() == "HEAD" else body]
+        return _ResponseBody(b"" if method.upper() == "HEAD" else body, finished)
 
     def _execute(self, request: HTTPRequest, func):
         # 匹配路由后执行 before，再绑定参数；异常交给 Application 统一处理。
@@ -186,6 +279,7 @@ class HTTPApplication:
                 if updated is not None:
                     if not isinstance(updated, HTTPRequest):
                         raise TypeError("before hooks must return HTTPRequest or None")
+                    updated.state = request.state
                     request = updated
                 if (request.method, request.path, request.path_info, request.query_string) != target:
                     raise RuntimeError("before hooks cannot change the matched request method or path")

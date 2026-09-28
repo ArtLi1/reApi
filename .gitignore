@@ -1,5 +1,7 @@
 __pycache__/
 .idea/
-examples/
+examples/*
+!examples/__init__.py
+!examples/basic.py
 test/
 AGENTS.md
