@@ -27,12 +27,12 @@ def read_http_request(client, timeout, max_header_bytes, max_body_bytes):
     # 总期限防止不断发送少量数据的客户端永久占用一个工作线程。
     deadline = time.monotonic() + timeout
 
-    def recv():
+    def recv(size=4096):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise socket.timeout("Request deadline exceeded")
         client.settimeout(remaining)
-        return client.recv(4096)
+        return client.recv(size)
 
     data = bytearray()
     while b"\r\n\r\n" not in data:
@@ -99,11 +99,13 @@ def read_http_request(client, timeout, max_header_bytes, max_body_bytes):
             raise HTTPProtocolError("Unsupported expectation", 417)
         if len(body) < length:
             client.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+    # Header 读取可能已经带入部分 Body；只接收声明长度内剩余的字节。
+    del body[length:]
     while len(body) < length:
-        chunk = recv()
+        chunk = recv(min(65536, length - len(body)))
         if not chunk:
             raise HTTPProtocolError("Incomplete request body")
         body.extend(chunk)
     client.settimeout(timeout)
-    # 单连接单请求：只交付声明长度的内容，多读到的下一条报文不进入 Body。
-    return IncomingRequest(method, target, version, headers, bytes(body[:length]))
+    # 单连接单请求：多读到的下一条报文不会进入 Body。
+    return IncomingRequest(method, target, version, headers, bytes(body))

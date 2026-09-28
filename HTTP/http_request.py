@@ -139,12 +139,18 @@ class HTTPRequest:
             length = int(length_text)
         except ValueError as error:
             raise BodyParameterError("Invalid Content-Length") from error
-        body = bytearray()
-        while len(body) < length:
-            chunk = environ["wsgi.input"].read(length - len(body))
-            if not chunk:
-                raise BodyParameterError("Incomplete request body")
-            body.extend(chunk)
+        # 常见输入流一次即可读全；仅对短读流启用累积缓冲区。
+        body = environ["wsgi.input"].read(length) if length else b""
+        if len(body) < length:
+            buffered = bytearray(body)
+            while len(buffered) < length:
+                chunk = environ["wsgi.input"].read(length - len(buffered))
+                if not chunk:
+                    raise BodyParameterError("Incomplete request body")
+                buffered.extend(chunk)
+            body = bytes(buffered)
+        elif type(body) is not bytes:
+            body = bytes(body)
         headers = {
             name[5:].replace("_", "-").lower(): value
             for name, value in environ.items()
@@ -158,7 +164,7 @@ class HTTPRequest:
         query = environ.get("QUERY_STRING", "")
         target = quote(path_info or "/", safe="/") + ("?" + query if query else "")
         request = cls(environ["REQUEST_METHOD"], target, environ.get("SERVER_PROTOCOL", "HTTP/1.1"),
-                      headers, bytes(body), parse_body=parse_body)
+                      headers, body, parse_body=parse_body)
         request.script_name = environ.get("SCRIPT_NAME", "").encode("iso-8859-1").decode("utf-8", "replace")
         request.scheme = environ.get("wsgi.url_scheme", "http")
         request.environ = environ

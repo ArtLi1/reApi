@@ -83,6 +83,7 @@ def t2(request: HTTPRequest, id: Path[int], q1: Query[int], uid: Path[int], user
 # request = HTTPRequest("GET", "/1/2/3", "", {}, "")
 # app.handle_request(request)
 app.register_module(Module1, 1, 2)
+app.enable_docs()
 if __name__ == "__main__":
     with app.lifecycle():
         HTTPServer(app).run()
