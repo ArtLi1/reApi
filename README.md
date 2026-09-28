@@ -19,6 +19,7 @@ python main.py --server wsgiref
 from HTTP import Depends, HTTPApplication, HTTPRequest, HTTPResponse, HTTPServer, Path, Query
 
 app = HTTPApplication()
+app.enable_docs(title="Demo API", version="1.0")
 
 def trace_id(request: HTTPRequest):
     return getattr(request.state, "request_id", "anonymous")
@@ -33,6 +34,8 @@ if __name__ == "__main__":
 ```
 
 `HTTPApplication` 是 WSGI callable，可交给其他 WSGI Server；`HTTPServer` 也可运行普通 WSGI callable。应用启动与关闭需由入口显式调用 `startup()/shutdown()` 或 `lifecycle()`；多进程部署时，在各工作进程中分别创建应用并启动资源。
+
+在上面的最小应用中，`/docs` 提供文档页面，`/openapi.json` 提供 OpenAPI 3.1.2 文档。
 
 ## 请求处理
 
@@ -74,7 +77,28 @@ def ping(db=Depends(connection)):
     return HTTPResponse(str(db.execute("SELECT 1").fetchone()[0]))
 ```
 
-`ServerModule` 在应用启动时初始化，并由所有请求共享；共享资源须支持并发访问。`yield` provider 在请求中取得资源，清理按依赖获取的逆序执行。直接调用 `handle_request/dispatch_request` 时，返回前清理；WSGI 调用在响应迭代结束或服务器关闭迭代器时清理，连接提前断开也会触发关闭。Handler 或依赖报错时立即清理。当前仅支持同步 provider 和缓冲的框架响应。
+`ServerModule` 在应用启动时初始化，并由所有请求共享；共享资源须支持并发访问。`yield` provider 在请求中取得资源，清理按依赖获取的逆序执行。缓冲响应的直接调用在返回前清理；流式响应通过 WSGI 消费，在迭代结束或服务器关闭迭代器时清理，连接提前断开也会触发关闭。Handler 或依赖报错时立即清理。当前仅支持同步 provider。
+
+## 响应与文档
+
+`JSONResponse(data)` 输出 JSON，支持 Pydantic 模型；`StreamingResponse(chunks, content_type="text/plain")` 按块发送 `bytes`；`FileResponse(path, filename="report.txt")` 按块读取文件。流式响应通过 WSGI 入口消费，未知长度不自动设置 `Content-Length`。响应对象提供 `set_cookie()` / `delete_cookie()`，可在一个响应中生成多个 `Set-Cookie`。
+
+流迭代期间的异常发生在响应头发送后，只会终止该次响应并释放资源；after Hook 如需改换流，应返回新的响应对象。
+
+```python
+from pydantic import BaseModel
+from HTTP import JSONResponse
+
+class ItemModel(BaseModel):
+    id: int
+
+@app.router.get_method("/items/{id}", summary="获取项目", tags=("items",),
+                       responses={200: ItemModel, 404: None})
+def get_item(id: Path[int]):
+    return JSONResponse(ItemModel(id=id.value))
+```
+
+路由的 `responses` 值可用模型类描述 JSON、用媒体类型字符串描述流或文件、用 `None` 表示无内容。文档读取最终挂载的路由以及 Handler、Hook、嵌套依赖的 Path/Query/Body 声明；响应状态和模型需显式声明。`*`、`**` 路由使用 `include_in_schema=False` 排除。文档描述的是声明的接口，框架暂不自动校验 Handler 的实际响应是否符合所声明的响应模型。
 
 ## 协议范围
 

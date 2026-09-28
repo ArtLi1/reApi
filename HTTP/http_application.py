@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 from contextlib import contextmanager
 from inspect import iscoroutinefunction, signature
 from threading import RLock
@@ -7,9 +8,10 @@ from time import monotonic
 from HTTP.http_dependencies import DependencyScope
 from HTTP.http_errors import HTTPError, ParameterValidationError
 from HTTP.http_module import ServerModule
+from HTTP.http_openapi import build_openapi, render_docs
 from HTTP.http_parameters import ParameterBinder
 from HTTP.http_request import HTTPRequest
-from HTTP.http_response import HTTPResponse
+from HTTP.http_response import HTTPResponse, JSONResponse, StreamingResponse
 from HTTP.http_router import HTTPRouter
 from Utils import ContentType
 
@@ -17,12 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 class _ResponseBody:
-    """WSGI 响应迭代器；迭代完毕和提前关闭都只记录一次。"""
+    """WSGI 响应迭代器；结束、出错和提前关闭时只释放一次。"""
 
-    def __init__(self, body, on_finish):
+    def __init__(self, body, on_finish, discard_source=None):
         self._body = body
+        self._iterator = None
+        self._discard_source = discard_source
         self._on_finish = on_finish
-        self._sent = False
 
     def __iter__(self):
         return self
@@ -30,20 +33,39 @@ class _ResponseBody:
     def __next__(self):
         if self._on_finish is None:
             raise StopIteration
-        if self._sent:
+        try:
+            if self._iterator is None:
+                self._iterator = iter((self._body,)) if type(self._body) is bytes else iter(self._body)
+            chunk = next(self._iterator)
+            if type(chunk) is not bytes:
+                raise TypeError("Streaming response chunks must be bytes")
+            return chunk
+        except StopIteration:
             self._finish("completed")
-            raise StopIteration
-        self._sent = True
-        return self._body
+            raise
+        except BaseException:
+            self._finish("failed")
+            raise
 
     def close(self):
         self._finish("closed")
 
     def _finish(self, outcome):
         callback, self._on_finish = self._on_finish, None
-        self._body = b""
-        if callback is not None:
-            callback(outcome)
+        source, iterator, discard = self._body, self._iterator, self._discard_source
+        self._body = self._iterator = self._discard_source = None
+        try:
+            # HEAD/无正文状态也必须关闭被忽略的流。
+            for target in (discard, source if discard is None else None, iterator if iterator is not source else None):
+                close = getattr(target, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        logger.exception("Response body close failed")
+        finally:
+            if callback is not None:
+                callback(outcome)
 
 
 class HTTPApplication:
@@ -57,8 +79,44 @@ class HTTPApplication:
         self._exception_handlers = {}
         self._middlewares = []
         self._state_lock = RLock()
+        self._docs_config = None
+        self._openapi_document = None
+        self._docs_html = None
         self.binder = ParameterBinder(self._resolve_module)
         self.router = HTTPRouter(self.binder)
+
+    def openapi(self, *, title="httpDemo", version="0.1.0"):
+        """返回独立的规范副本；启用文档后使用启动时生成的版本。"""
+        if self._openapi_document is not None:
+            return deepcopy(self._openapi_document)
+        if self._docs_config is not None:
+            title, version, _ = self._docs_config
+        return build_openapi(self.router, title, version)
+
+    def enable_docs(self, *, title="httpDemo", version="0.1.0",
+                    docs_path="/docs", openapi_path="/openapi.json"):
+        """注册文档端点，启动时一次性生成规范。"""
+        if self._docs_config is not None:
+            raise RuntimeError("Documentation is already enabled")
+        docs_path = self.router._normalize_path(docs_path)
+        openapi_path = self.router._normalize_path(openapi_path)
+        if docs_path == openapi_path:
+            raise ValueError("Documentation paths must differ")
+        if not isinstance(title, str) or not title or not isinstance(version, str) or not version:
+            raise ValueError("Documentation title and version must be non-empty strings")
+        for path in (docs_path, openapi_path):
+            if "GET" in self.router._resources.get(self.router._shape(path), {}):
+                raise ValueError(f"Documentation route already registered: {path}")
+
+        @self.router.get_method(openapi_path, include_in_schema=False)
+        def openapi_json():
+            return JSONResponse(self._openapi_document)
+
+        @self.router.get_method(docs_path, include_in_schema=False)
+        def documentation():
+            return HTTPResponse(self._docs_html, content_type=ContentType.HTML)
+
+        self._docs_config = title, version, openapi_path
 
     def register_module(self, module_class, *args, **kwargs):
         if not isinstance(module_class, type) or not issubclass(module_class, ServerModule):
@@ -166,6 +224,10 @@ class HTTPApplication:
             self._initialization_started = True
             try:
                 self.router.freeze(self._modules)
+                if self._docs_config is not None:
+                    title, version, openapi_path = self._docs_config
+                    self._openapi_document = build_openapi(self.router, title, version)
+                    self._docs_html = render_docs(self._openapi_document, openapi_path)
                 for module in self._modules.values():
                     self._initialized_modules.append(module)
                     module.server_init()
@@ -204,7 +266,10 @@ class HTTPApplication:
             # 自动 OPTIONS 仅描述路由能力，不执行业务参数绑定及路由 Hook。
             if func is self.router._automatic_options:
                 return func(request)
-            return self._execute(request, func)
+            response = self._execute(request, func)
+            if owns_scope and isinstance(response, StreamingResponse):
+                raise RuntimeError("StreamingResponse must be consumed through the WSGI application")
+            return response
         except BaseException as error:
             if owns_scope:
                 request._dependency_scope.close(error)
@@ -253,7 +318,10 @@ class HTTPApplication:
                 return self.error_handler(error, request)
 
         try:
-            return run(0)
+            response = run(0)
+            if not _defer_dependencies and isinstance(response, StreamingResponse):
+                raise RuntimeError("StreamingResponse must be consumed through the WSGI application")
+            return response
         except BaseException as error:
             request._dependency_scope.close(error)
             raise
@@ -274,7 +342,8 @@ class HTTPApplication:
         except Exception as error:
             if request is not None and request._dependency_scope is not None:
                 request._dependency_scope.close(error)
-            status, headers, body = self.error_handler(error, request).to_wsgi()
+            response = self.error_handler(error, request)
+            status, headers, body = response.to_wsgi()
         # start_response 的服务器异常不能再次包装成另一份响应。
         method = environ.get("REQUEST_METHOD", "")
         path = environ.get("PATH_INFO", "")
@@ -294,7 +363,9 @@ class HTTPApplication:
             raise
         # Application 负责 HEAD 语义，换用外部 WSGI Server 也不会发送正文。
         # Content-Length 保留正常响应长度，after 仍处理完整 Response。
-        return _ResponseBody(b"" if method.upper() == "HEAD" else body, finished)
+        suppress_body = method.upper() == "HEAD" or status.startswith(("1", "204 ", "304 "))
+        discarded = response._stream if suppress_body and isinstance(response, StreamingResponse) else None
+        return _ResponseBody(b"" if suppress_body else body, finished, discarded)
 
     def _execute(self, request: HTTPRequest, func):
         # 匹配路由后执行 before，再绑定参数；异常交给 Application 统一处理。

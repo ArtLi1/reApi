@@ -25,6 +25,7 @@ class HTTPRouter:
         self._ordered_resources = []
         self._before_handlers = []
         self._after_handlers = []
+        self._route_metadata = {}
         self._frozen = False
         self._registration_lock = Lock()
         self.binder = binder if binder is not None else ParameterBinder()
@@ -113,7 +114,7 @@ class HTTPRouter:
         if self._frozen:
             raise RuntimeError("Routes and hooks must be registered before application startup")
 
-    def _prepare_route(self, path, method, func):
+    def _prepare_route(self, path, method, func, metadata):
         pattern = self._compile_path(path)  # 注册时编译，非法声明不会留到请求阶段。
         shape = self._shape(path)
         if method in self._resources.get(shape, {}):
@@ -123,17 +124,19 @@ class HTTPRouter:
             annotation, optional = self.binder._unwrap_optional(param.annotation)
             if get_origin(annotation) is Path and not optional and name not in pattern.groupindex:
                 raise TypeError(f"{func.__name__}.{name} is not in route path: {path}")
-        return path, method, func, shape, pattern, parameters
+        return path, method, func, shape, pattern, parameters, metadata
 
     def _add_route(self, prepared):
-        path, method, func, shape, pattern, parameters = prepared
+        path, method, func, shape, pattern, parameters, metadata = prepared
         self.binder.parameters[(func, "handler")] = parameters
         self.listening.setdefault(method, {})[path] = func
+        self._route_metadata[(method, path)] = metadata
         self._resources.setdefault(shape, {})[method] = (pattern, func)
         # ponytail: 注册时排序，请求仍线性扫描；路由量成为瓶颈后再引入索引树。
         self._ordered_resources = sorted(self._resources, key=self._specificity, reverse=True)
 
-    def route(self, path: str, methods=("GET",)):
+    def route(self, path: str, methods=("GET",), *, summary=None, description=None,
+              tags=(), responses=None, include_in_schema=True):
         """注册一个或多个 HTTP 方法；返回原函数，支持叠加装饰器。"""
         path = self._normalize_path(self.prefix + self._normalize_path(path))
         self._compile_path(path)
@@ -145,12 +148,29 @@ class HTTPRouter:
         methods = tuple(method.upper() for method in methods)
         if len(set(methods)) != len(methods):
             raise ValueError("Duplicate HTTP method in route declaration")
+        if summary is not None and not isinstance(summary, str):
+            raise TypeError("summary must be a string")
+        if description is not None and not isinstance(description, str):
+            raise TypeError("description must be a string")
+        if isinstance(tags, str):
+            raise TypeError("tags must be an iterable of strings")
+        tags = tuple(tags)
+        if any(not isinstance(tag, str) for tag in tags):
+            raise TypeError("tags must contain strings")
+        if responses is not None and not isinstance(responses, dict):
+            raise TypeError("responses must be a mapping of status codes to models or media types")
+        if responses and any(type(code) is not int or not 100 <= code <= 599 for code in responses):
+            raise ValueError("Response status must be an integer from 100 to 599")
+        if type(include_in_schema) is not bool:
+            raise TypeError("include_in_schema must be a bool")
+        metadata = {"summary": summary, "description": description, "tags": tags,
+                    "responses": dict(responses or {}), "include_in_schema": include_in_schema}
 
         def decorator(func):
             with self._registration_lock:
                 self._ensure_mutable()
                 # 先检查整个注册，避免多方法声明只成功一半。
-                prepared = [self._prepare_route(path, method, func) for method in methods]
+                prepared = [self._prepare_route(path, method, func, metadata) for method in methods]
                 for entry in prepared:
                     self._add_route(entry)
             return func
@@ -185,14 +205,15 @@ class HTTPRouter:
         mount = self.prefix + self._validate_prefix(prefix)
         # 先取快照再锁父路由，避免相互挂载时产生锁顺序死锁。
         with router._registration_lock:
-            routes = [(mount + path, method, func)
+            routes = [(mount + path, method, func, dict(router._route_metadata[(method, path)]))
                       for method, paths in router.listening.items() for path, func in paths.items()]
             hooks = [(stage, priority, mount + path, func)
                      for stage, entries in (("before", router._before_handlers), ("after", router._after_handlers))
                      for priority, path, func in entries]
         with self._registration_lock:
             self._ensure_mutable()
-            prepared = [self._prepare_route(self._normalize_path(path), method, func) for path, method, func in routes]
+            prepared = [self._prepare_route(self._normalize_path(path), method, func, metadata)
+                        for path, method, func, metadata in routes]
             compiled_hooks = [(stage, priority, self._normalize_path(path), func, self.binder.compile(func, stage))
                               for stage, priority, path, func in hooks]
             for _, _, path, _, _ in compiled_hooks:
@@ -211,26 +232,26 @@ class HTTPRouter:
     def after_handler(self, path: str, priority: int | float):
         return self._register_hook(self._after_handlers, path, priority, "after")
 
-    def get_method(self, path: str):
-        return self.route(path, ("GET",))
+    def get_method(self, path: str, **options):
+        return self.route(path, ("GET",), **options)
 
-    def post_method(self, path: str):
-        return self.route(path, ("POST",))
+    def post_method(self, path: str, **options):
+        return self.route(path, ("POST",), **options)
 
-    def put_method(self, path: str):
-        return self.route(path, ("PUT",))
+    def put_method(self, path: str, **options):
+        return self.route(path, ("PUT",), **options)
 
-    def delete_method(self, path: str):
-        return self.route(path, ("DELETE",))
+    def delete_method(self, path: str, **options):
+        return self.route(path, ("DELETE",), **options)
 
-    def patch_method(self, path: str):
-        return self.route(path, ("PATCH",))
+    def patch_method(self, path: str, **options):
+        return self.route(path, ("PATCH",), **options)
 
-    def head_method(self, path: str):
-        return self.route(path, ("HEAD",))
+    def head_method(self, path: str, **options):
+        return self.route(path, ("HEAD",), **options)
 
-    def options_method(self, path: str):
-        return self.route(path, ("OPTIONS",))
+    def options_method(self, path: str, **options):
+        return self.route(path, ("OPTIONS",), **options)
 
     @staticmethod
     def _automatic_options(request):
