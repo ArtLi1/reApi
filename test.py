@@ -1,5 +1,6 @@
 from typing import Optional
 
+from HTTP import Depends
 from HTTP.http_models import Path, Query, Body
 from HTTP.http_module import ServerModule
 from HTTP.http_request import HTTPRequest
@@ -42,20 +43,30 @@ def b2(req: HTTPRequest, res: HTTPResponse):
     return res
 
 
+def d1():
+    temp = 0
+
+    def x():
+        nonlocal temp
+        print(temp)
+        temp += 1
+
+    return x
+
+
 @app.router.get_method("/1/{id}/{uid}")
 def f1(
-    request: HTTPRequest,
-    id: Path[int],
-    q1: Query[int],
-    module1: Module1,
-    q2: Query[int] | None,
-    q3: Optional[Query[int]],
+        request: HTTPRequest,
+        id: Path[int],
+        q1: Query[int],
+        module1: Module1,
+        q2: Query[int] | None,
+        q3: Optional[Query[int]],
+        x1=Depends(d1,use_cache=True)
 ):
-    print(q1.value)
-    print(q2)
-    print(q3)
-    print(request.path_params["id"])
-    return HTTPResponse(body=f"Hello World!{request.path_params['id']},{request.path_params['uid']}",
+    x1()
+    x1()
+    return HTTPResponse(body=f"Hello World!",
                         content_type=ContentType.HTML)
 
 
