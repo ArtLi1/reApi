@@ -4,6 +4,7 @@ from inspect import iscoroutinefunction, signature
 from threading import RLock
 from time import monotonic
 
+from HTTP.http_dependencies import DependencyScope
 from HTTP.http_errors import HTTPError, ParameterValidationError
 from HTTP.http_module import ServerModule
 from HTTP.http_parameters import ParameterBinder
@@ -195,13 +196,26 @@ class HTTPApplication:
 
     def dispatch_request(self, request: HTTPRequest):
         """执行内部流程并保留异常，供测试或上层异常边界调用。"""
-        func = self.router.match(request)
-        # 自动 OPTIONS 仅描述路由能力，不执行业务参数绑定及路由 Hook。
-        if func is self.router._automatic_options:
-            return func(request)
-        return self._execute(request, func)
+        owns_scope = request._dependency_scope is None or request._dependency_scope.closed
+        if owns_scope:
+            request._dependency_scope = DependencyScope(self.binder)
+        try:
+            func = self.router.match(request)
+            # 自动 OPTIONS 仅描述路由能力，不执行业务参数绑定及路由 Hook。
+            if func is self.router._automatic_options:
+                return func(request)
+            return self._execute(request, func)
+        except BaseException as error:
+            if owns_scope:
+                request._dependency_scope.close(error)
+            raise
+        finally:
+            if owns_scope:
+                request._dependency_scope.close()
 
-    def handle_request(self, request: HTTPRequest):
+    def handle_request(self, request: HTTPRequest, *, _defer_dependencies=False):
+        request._dependency_scope = DependencyScope(self.binder)
+
         def run(index):
             try:
                 if index == len(self._middlewares):
@@ -233,10 +247,19 @@ class HTTPApplication:
                 response.to_wsgi()
                 return response
             except Exception as error:
+                # 错误响应生成前先释放已获取的资源。
+                request._dependency_scope.close(error)
                 # 每一层都把下游错误转为 Response，外层 Middleware 可统一处理 4xx/5xx。
                 return self.error_handler(error, request)
 
-        return run(0)
+        try:
+            return run(0)
+        except BaseException as error:
+            request._dependency_scope.close(error)
+            raise
+        finally:
+            if not _defer_dependencies:
+                request._dependency_scope.close()
 
     def __call__(self, environ, start_response):
         # 包含请求构造和响应转换，保证非法 JSON 与 Handler 异常使用同一错误格式。
@@ -246,9 +269,11 @@ class HTTPApplication:
             if not self._modules_ready:
                 raise RuntimeError("Use application.lifecycle() or startup() before serving")
             request = HTTPRequest.from_environ(environ, parse_body=False)
-            response = self.handle_request(request)
+            response = self.handle_request(request, _defer_dependencies=True)
             status, headers, body = response.to_wsgi()
         except Exception as error:
+            if request is not None and request._dependency_scope is not None:
+                request._dependency_scope.close(error)
             status, headers, body = self.error_handler(error, request).to_wsgi()
         # start_response 的服务器异常不能再次包装成另一份响应。
         method = environ.get("REQUEST_METHOD", "")
@@ -256,6 +281,8 @@ class HTTPApplication:
         request_id = getattr(request.state, "request_id", None) if request is not None else None
 
         def finished(outcome):
+            if request is not None and request._dependency_scope is not None:
+                request._dependency_scope.close()
             logger.info("HTTP %r %r %s %.2fms request_id=%r outcome=%s",
                         method, path, status.split(" ", 1)[0], (monotonic() - started) * 1000,
                         request_id, outcome)
@@ -280,6 +307,7 @@ class HTTPApplication:
                     if not isinstance(updated, HTTPRequest):
                         raise TypeError("before hooks must return HTTPRequest or None")
                     updated.state = request.state
+                    updated._dependency_scope = request._dependency_scope
                     request = updated
                 if (request.method, request.path, request.path_info, request.query_string) != target:
                     raise RuntimeError("before hooks cannot change the matched request method or path")

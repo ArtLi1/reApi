@@ -4,6 +4,7 @@ from functools import lru_cache
 from threading import Lock
 from typing import get_origin
 
+from HTTP.http_dependencies import Depends
 from HTTP.http_errors import MethodNotAllowedError, RouteNotFoundError
 from HTTP.http_models import Path
 from HTTP.http_parameters import ParameterBinder
@@ -34,12 +35,21 @@ class HTTPRouter:
             callbacks = [(func, "handler") for routes in self.listening.values() for func in routes.values()]
             callbacks.extend((func, "before") for _, _, func in self._before_handlers)
             callbacks.extend((func, "after") for _, _, func in self._after_handlers)
-            for func, stage in callbacks:
+            visited = set()
+            while callbacks:
+                func, stage = callbacks.pop()
+                if (func, stage) in visited:
+                    continue
+                visited.add((func, stage))
                 parameters = self.binder.parameters[(func, stage)]
                 for param in parameters.values():
+                    if isinstance(param.default, Depends):
+                        callbacks.append((param.default.provider, "dependency"))
+                        continue
                     annotation, optional = self.binder._unwrap_optional(param.annotation)
                     if self.binder._is_module(annotation) and not optional and annotation not in module_classes:
-                        raise TypeError(f"{func.__name__} requires unregistered module: {annotation.__name__}")
+                        label = getattr(func, "__name__", type(func).__name__)
+                        raise TypeError(f"{label} requires unregistered module: {annotation.__name__}")
             self._frozen = True
 
     @staticmethod

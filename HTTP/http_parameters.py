@@ -1,11 +1,12 @@
 import json
 from dataclasses import is_dataclass
-from inspect import signature
+from inspect import isfunction, ismethod, signature
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, create_model
 
+from HTTP.http_dependencies import Depends
 from HTTP.http_errors import BodyParameterError, PathParameterError, QueryParameterError
 from HTTP.http_models import Body, Path, Query
 from HTTP.http_module import ServerModule
@@ -20,6 +21,7 @@ class ParameterBinder:
         self.parameters = {}
         self._body_models = {}
         self._module_resolver = module_resolver
+        self._compiling = set()
 
     def _compile_body_model(self, model):
         if model in self._body_models:
@@ -69,40 +71,56 @@ class ParameterBinder:
         return annotation, False
 
     def compile(self, func, stage):
-        hints = get_type_hints(func)
-        parameters = {}
-        for name, param in signature(func).parameters.items():
-            if param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
-                raise TypeError(f"{func.__name__}.{name} must be a named parameter")
-            declared = hints.get(name, param.annotation)
-            annotation, optional = self._unwrap_optional(declared)
-            kind = get_origin(annotation) or annotation
-            if annotation is HTTPRequest or self._is_module(annotation):
-                pass
-            elif annotation is HTTPResponse:
-                if stage != "after":
-                    raise TypeError("HTTPResponse can only be injected into after hooks")
-            elif kind in (Path, Query):
-                args = get_args(annotation)
-                # URL 参数只支持可明确从文本解析的四种基本类型。
-                if len(args) != 1 or args[0] not in (str, int, float, bool):
-                    raise TypeError(f"{func.__name__}.{name} must be Path/Query[str, int, float, or bool]")
-            elif kind is Body:
-                args = get_args(annotation)
-                if len(args) != 1 or not isinstance(args[0], type):
-                    raise TypeError(f"{func.__name__}.{name} must be Body[ModelClass]")
-                self._compile_body_model(args[0])
-            else:
-                raise TypeError(f"Unsupported annotation for {func.__name__}.{name}: {annotation}")
-            if not optional and param.default is not param.empty and kind in (Path, Query, Body):
-                if not isinstance(param.default, kind):
-                    raise TypeError(f"{func.__name__}.{name} default must be a {kind.__name__} value")
-                typ = get_args(annotation)[0]
-                valid = isinstance(param.default.value, typ) if kind is Body else type(param.default.value) is typ
-                if not valid:
-                    raise TypeError(f"{func.__name__}.{name} default does not match its annotation")
-            parameters[name] = param.replace(annotation=declared)
-        return parameters
+        key = func, stage
+        if key in self._compiling:
+            raise TypeError(f"Circular dependency involving {getattr(func, '__name__', func)}")
+        self._compiling.add(key)
+        try:
+            hint_source = func if isfunction(func) or ismethod(func) else (
+                func.__init__ if isinstance(func, type) else getattr(func, "func", getattr(func, "__call__", func)))
+            hints = get_type_hints(hint_source)
+            parameters = {}
+            for name, param in signature(func).parameters.items():
+                label = getattr(func, "__name__", type(func).__name__)
+                if param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
+                    raise TypeError(f"{label}.{name} must be a named parameter")
+                if isinstance(param.default, Depends):
+                    provider = param.default.provider
+                    if (provider, "dependency") not in self.parameters:
+                        self.parameters[(provider, "dependency")] = self.compile(provider, "dependency")
+                    parameters[name] = param
+                    continue
+                declared = hints.get(name, param.annotation)
+                annotation, optional = self._unwrap_optional(declared)
+                kind = get_origin(annotation) or annotation
+                if annotation is HTTPRequest or self._is_module(annotation):
+                    pass
+                elif annotation is HTTPResponse:
+                    if stage != "after":
+                        raise TypeError("HTTPResponse can only be injected into after hooks")
+                elif kind in (Path, Query):
+                    args = get_args(annotation)
+                    # URL 参数只支持可明确从文本解析的四种基本类型。
+                    if len(args) != 1 or args[0] not in (str, int, float, bool):
+                        raise TypeError(f"{label}.{name} must be Path/Query[str, int, float, or bool]")
+                elif kind is Body:
+                    args = get_args(annotation)
+                    if len(args) != 1 or not isinstance(args[0], type):
+                        raise TypeError(f"{label}.{name} must be Body[ModelClass]")
+                    self._compile_body_model(args[0])
+                else:
+                    raise TypeError(f"Unsupported annotation for {label}.{name}: {annotation}")
+                if not optional and param.default is not param.empty and kind in (Path, Query, Body):
+                    if not isinstance(param.default, kind):
+                        raise TypeError(f"{label}.{name} default must be a {kind.__name__} value")
+                    typ = get_args(annotation)[0]
+                    valid = isinstance(param.default.value, typ) if kind is Body else type(param.default.value) is typ
+                    if not valid:
+                        raise TypeError(f"{label}.{name} default does not match its annotation")
+                parameters[name] = param.replace(annotation=declared)
+            return parameters
+        finally:
+            self._compiling.remove(key)
 
     @staticmethod
     def _parse_basic(value: str, typ: type):
@@ -122,6 +140,9 @@ class ParameterBinder:
         """按注解绑定命名参数；模块仅从应用获取，绝不在请求中创建。"""
         args = {}
         for name, param in self.parameters[(func, stage)].items():
+            if isinstance(param.default, Depends):
+                args[name] = request._dependency_scope.resolve(param.default, request)
+                continue
             annotation, optional = self._unwrap_optional(param.annotation)
             kind = get_origin(annotation)
             if annotation is HTTPRequest:
@@ -146,7 +167,8 @@ class ParameterBinder:
                     if param.default is not param.empty:
                         continue
                     if is_path:
-                        raise RuntimeError(f"{func.__name__}.{name} is not available in this route")
+                        label = getattr(func, "__name__", type(func).__name__)
+                        raise RuntimeError(f"{label}.{name} is not available in this route")
                     raise QueryParameterError(f"Missing query parameter: {name}",
                                               location=(label, name), error_type="missing")
                 try:

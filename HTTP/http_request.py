@@ -46,6 +46,7 @@ class HTTPRequest:
         self.path_params = {}
         # 请求独享的状态，供 Middleware、Hook 与 Handler 传递临时数据。
         self.state = SimpleNamespace()
+        self._dependency_scope = None
         self._body_parsed = parse_body
         if parse_body:
             self._parse_body()
