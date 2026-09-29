@@ -1,4 +1,5 @@
-"""轻量同步 WSGI 框架的公共接口。"""
+"""轻量同步 HTTP 框架的公共接口。"""
+from HTTP.http_asgi import ASGIAdapter
 from HTTP.http_application import HTTPApplication
 from HTTP.http_dependencies import Depends
 from HTTP.http_errors import (BodyParameterError, HTTPError, MethodNotAllowedError,
@@ -11,7 +12,7 @@ from HTTP.http_response import FileResponse, HTTPResponse, JSONResponse, Streami
 from HTTP.http_router import HTTPRouter
 from HTTP.http_server import HTTPServer
 
-__all__ = ["HTTPApplication", "HTTPServer", "HTTPRouter", "HTTPRequest", "HTTPResponse",
+__all__ = ["HTTPApplication", "HTTPServer", "ASGIAdapter", "HTTPRouter", "HTTPRequest", "HTTPResponse",
            "JSONResponse", "StreamingResponse", "FileResponse", "Depends",
            "ServerModule", "Path", "Query", "Body", "HTTPError", "ParameterValidationError",
            "PathParameterError", "QueryParameterError", "BodyParameterError",

@@ -1,6 +1,6 @@
 # httpDemo
 
-轻量同步 Python Web 框架和多线程 WSGI Server。支持 Python 3.10+；网络层使用标准库，请求体模型校验使用 Pydantic 2。
+轻量同步 Python Web 框架，提供 WSGI 和 ASGI 入口，以及多线程 WSGI Server。支持 Python 3.10+；网络层使用标准库，请求体模型校验使用 Pydantic 2。
 
 ## 运行
 
@@ -9,6 +9,9 @@ python -m pip install -r requirements.txt
 python main.py
 # 或使用标准库 WSGI Server
 python main.py --server wsgiref
+# ASGI 入口需要另装 ASGI Server
+python -m pip install uvicorn
+python main.py --server asgi
 ```
 
 示例接口：`GET /`、`GET /hello/Alice?tag=demo`、`POST /echo`（JSON 请求体 `{"text":"hello"}`）。
@@ -33,7 +36,7 @@ if __name__ == "__main__":
         HTTPServer(app).run()
 ```
 
-`HTTPApplication` 是 WSGI callable，可交给其他 WSGI Server；`HTTPServer` 也可运行普通 WSGI callable。应用启动与关闭需由入口显式调用 `startup()/shutdown()` 或 `lifecycle()`；多进程部署时，在各工作进程中分别创建应用并启动资源。
+`HTTPApplication` 是 WSGI callable，可交给其他 WSGI Server；`HTTPServer` 也可运行普通 WSGI callable。WSGI 入口需显式调用 `startup()/shutdown()` 或 `lifecycle()`。ASGI 入口使用 `ASGIAdapter(app)`，通过 lifespan 自动启动和关闭模块；多进程部署时，在各工作进程中分别创建应用并启动资源。
 
 在上面的最小应用中，`/docs` 提供文档页面，`/openapi.json` 提供 OpenAPI 3.1.2 文档。
 
@@ -42,7 +45,7 @@ if __name__ == "__main__":
 ```text
 Middleware 进入 → 解析请求体 → 匹配路由 → before Hook
 → 绑定 Handler 和 after 参数 → Handler → after Hook
-→ Middleware 返回 → WSGI 响应迭代与关闭
+→ Middleware 返回 → WSGI/ASGI 响应迭代与关闭
 ```
 
 - 路由支持 `GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS`、多方法声明和 `include_router`。最具体路径先匹配，再判断方法；无路由返回 404，方法不匹配返回 405 和 `Allow`。HEAD 可复用 GET；未显式声明的 OPTIONS 自动返回 204。
@@ -77,11 +80,11 @@ def ping(db=Depends(connection)):
     return HTTPResponse(str(db.execute("SELECT 1").fetchone()[0]))
 ```
 
-`ServerModule` 在应用启动时初始化，并由所有请求共享；共享资源须支持并发访问。`yield` provider 在请求中取得资源，清理按依赖获取的逆序执行。缓冲响应的直接调用在返回前清理；流式响应通过 WSGI 消费，在迭代结束或服务器关闭迭代器时清理，连接提前断开也会触发关闭。Handler 或依赖报错时立即清理。当前仅支持同步 provider。
+`ServerModule` 在应用启动时初始化，并由所有请求共享；共享资源须支持并发访问。`yield` provider 在请求中取得资源，清理按依赖获取的逆序执行。缓冲响应的直接调用在返回前清理；流式响应在迭代结束或连接提前断开时清理。Handler 或依赖报错时立即清理。当前仅支持同步 provider。
 
 ## 响应与文档
 
-`JSONResponse(data)` 输出 JSON，支持 Pydantic 模型；`StreamingResponse(chunks, content_type="text/plain")` 按块发送 `bytes`；`FileResponse(path, filename="report.txt")` 按块读取文件。流式响应通过 WSGI 入口消费，未知长度不自动设置 `Content-Length`。响应对象提供 `set_cookie()` / `delete_cookie()`，可在一个响应中生成多个 `Set-Cookie`。
+`JSONResponse(data)` 输出 JSON，支持 Pydantic 模型；`StreamingResponse(chunks, content_type="text/plain")` 按块发送 `bytes`；`FileResponse(path, filename="report.txt")` 按块读取文件。流式响应通过 WSGI 或 ASGI 入口消费，未知长度不自动设置 `Content-Length`。响应对象提供 `set_cookie()` / `delete_cookie()`，可在一个响应中生成多个 `Set-Cookie`。
 
 流迭代期间的异常发生在响应头发送后，只会终止该次响应并释放资源；after Hook 如需改换流，应返回新的响应对象。
 
@@ -103,3 +106,5 @@ def get_item(id: Path[int]):
 ## 协议范围
 
 自带 Server 支持 HTTP/1.0、HTTP/1.1 的单请求连接、线程池及读取期限；每个连接响应后关闭。默认 Header 上限 64 KiB、Body 上限 10 MiB、总读取期限 10 秒。不支持 TLS、Keep-Alive 或 chunked 请求体；外部 WSGI Server 的网络限制由外部配置管理。
+
+ASGI 入口支持 HTTP 与 lifespan，Body 默认上限 10 MiB；同步 Handler、Hook、Middleware、依赖和响应流在线程中运行。连接断开后会释放响应流资源，但无法中断正在执行的同步 Handler。ASGI Server 负责网络协议和连接管理；WebSocket 与原生异步 Handler 暂不支持。

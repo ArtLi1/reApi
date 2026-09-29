@@ -1,6 +1,6 @@
 from typing import Optional
 
-from HTTP import Depends
+from HTTP import Depends, ASGIAdapter
 from HTTP.http_models import Path, Query, Body
 from HTTP.http_module import ServerModule
 from HTTP.http_request import HTTPRequest
@@ -8,7 +8,7 @@ from HTTP.http_response import HTTPResponse
 from HTTP.http_application import HTTPApplication
 from HTTP.http_server import HTTPServer
 from Utils import ContentType
-
+import uvicorn
 app = HTTPApplication()
 
 
@@ -85,5 +85,5 @@ def t2(request: HTTPRequest, id: Path[int], q1: Query[int], uid: Path[int], user
 app.register_module(Module1, 1, 2)
 app.enable_docs()
 if __name__ == "__main__":
-    with app.lifecycle():
-        HTTPServer(app).run()
+    uvicorn.run(ASGIAdapter(app), host="0.0.0.0", port=8000,lifespan="on")
+
