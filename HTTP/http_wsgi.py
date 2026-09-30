@@ -3,9 +3,8 @@ import io
 import sys
 from urllib.parse import unquote_to_bytes, urlsplit
 from wsgiref.handlers import SimpleHandler
-from wsgiref.util import is_hop_by_hop
 
-from HTTP.http_protocol import TOKEN
+from HTTP.http_validation import validate_response
 
 
 def build_environ(request, address, server_name, server_port):
@@ -28,30 +27,6 @@ def build_environ(request, address, server_name, server_port):
         # 特殊字段按原始名称判断，Content_Length 不能伪装成报文长度。
         environ[key if name in ("content-type", "content-length") else "HTTP_" + key] = value
     return environ
-
-
-def validate_response(status, headers):
-    """在网络输出前检查类型、编码和换行，避免无效状态或响应头注入。"""
-    if type(status) is not str or len(status) < 4 or not status[:3].isdigit() or status[3] != " ":
-        raise ValueError("Invalid WSGI status")
-    if not 100 <= int(status[:3]) <= 999 or "\r" in status or "\n" in status:
-        raise ValueError("Invalid WSGI status")
-    status.encode("iso-8859-1")
-    lengths = []
-    for name, value in headers:
-        if type(name) is not str or type(value) is not str or not TOKEN.fullmatch(name):
-            raise ValueError("Invalid response header")
-        if any(ord(char) < 32 and char != "\t" or ord(char) == 127 for char in value):
-            raise ValueError("Invalid response header value")
-        value.encode("iso-8859-1")
-        if is_hop_by_hop(name):
-            raise ValueError("WSGI applications cannot set hop-by-hop headers")
-        if name.lower() == "content-length":
-            if not value.isascii() or not value.isdecimal():
-                raise ValueError("Invalid response Content-Length")
-            lengths.append(int(value))
-    if len(lengths) > 1:
-        raise ValueError("Duplicate response Content-Length")
 
 
 class WSGIRequestHandler(SimpleHandler):

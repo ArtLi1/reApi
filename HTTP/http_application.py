@@ -1,6 +1,7 @@
 import logging
 from copy import deepcopy
 from contextlib import contextmanager
+from dataclasses import dataclass
 from inspect import iscoroutinefunction, signature
 from threading import RLock
 from time import monotonic
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class _ResponseBody:
-    """WSGI 响应迭代器；结束、出错和提前关闭时只释放一次。"""
+    """共用响应迭代器；结束、出错和提前关闭时只释放一次。"""
 
     def __init__(self, body, on_finish, discard_source=None):
         self._body = body
@@ -68,8 +69,16 @@ class _ResponseBody:
                 callback(outcome)
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedResponse:
+    code: int
+    reason: str
+    headers: list[tuple[str, str]]
+    body: _ResponseBody
+
+
 class HTTPApplication:
-    """可交给任意 WSGI Server 的应用；应用资源不依赖 Socket 服务器。"""
+    """共用 HTTP 处理逻辑；WSGI 直接调用，ASGI 通过适配器调用。"""
 
     def __init__(self):
         self._modules = {}
@@ -193,7 +202,7 @@ class HTTPApplication:
                 if not isinstance(response, HTTPResponse):
                     raise TypeError("Exception handlers must return HTTPResponse")
                 # 在返回前检查响应，避免错误处理器的错误再次进入同一个处理器。
-                response.to_wsgi()
+                response.to_http()
                 return response
             except Exception:
                 logger.exception("Exception handler failed")
@@ -268,7 +277,7 @@ class HTTPApplication:
                 return func(request)
             response = self._execute(request, func)
             if owns_scope and isinstance(response, StreamingResponse):
-                raise RuntimeError("StreamingResponse must be consumed through the WSGI application")
+                raise RuntimeError("StreamingResponse must be consumed through WSGI or ASGI")
             return response
         except BaseException as error:
             if owns_scope:
@@ -309,7 +318,7 @@ class HTTPApplication:
                 if not isinstance(response, HTTPResponse):
                     raise TypeError("Middleware must return HTTPResponse")
                 # 在每一层检查输出，外层 Middleware 才能看见无效响应转换成的 500。
-                response.to_wsgi()
+                response.to_http()
                 return response
             except Exception as error:
                 # 错误响应生成前先释放已获取的资源。
@@ -320,7 +329,7 @@ class HTTPApplication:
         try:
             response = run(0)
             if not _defer_dependencies and isinstance(response, StreamingResponse):
-                raise RuntimeError("StreamingResponse must be consumed through the WSGI application")
+                raise RuntimeError("StreamingResponse must be consumed through WSGI or ASGI")
             return response
         except BaseException as error:
             request._dependency_scope.close(error)
@@ -329,43 +338,48 @@ class HTTPApplication:
             if not _defer_dependencies:
                 request._dependency_scope.close()
 
-    def __call__(self, environ, start_response):
-        # 包含请求构造和响应转换，保证非法 JSON 与 Handler 异常使用同一错误格式。
-        started = monotonic()
+    def _prepare_response(self, request_factory, *, method, path, started):
+        """共用调度、错误转换和请求级资源清理。"""
         request = None
         try:
             if not self._modules_ready:
                 raise RuntimeError("Use application.lifecycle() or startup() before serving")
-            request = HTTPRequest.from_environ(environ, parse_body=False)
+            request = request_factory()
             response = self.handle_request(request, _defer_dependencies=True)
-            status, headers, body = response.to_wsgi()
+            code, headers, body = response.to_http()
         except Exception as error:
             if request is not None and request._dependency_scope is not None:
                 request._dependency_scope.close(error)
             response = self.error_handler(error, request)
-            status, headers, body = response.to_wsgi()
-        # start_response 的服务器异常不能再次包装成另一份响应。
-        method = environ.get("REQUEST_METHOD", "")
-        path = environ.get("PATH_INFO", "")
+            code, headers, body = response.to_http()
         request_id = getattr(request.state, "request_id", None) if request is not None else None
 
         def finished(outcome):
             if request is not None and request._dependency_scope is not None:
                 request._dependency_scope.close()
             logger.info("HTTP %r %r %s %.2fms request_id=%r outcome=%s",
-                        method, path, status.split(" ", 1)[0], (monotonic() - started) * 1000,
+                        method, path, code, (monotonic() - started) * 1000,
                         request_id, outcome)
 
-        try:
-            start_response(status, headers)
-        except BaseException:
-            finished("start_failed")
-            raise
-        # Application 负责 HEAD 语义，换用外部 WSGI Server 也不会发送正文。
+        # 两种入口使用相同的 HEAD 与无正文状态语义。
         # Content-Length 保留正常响应长度，after 仍处理完整 Response。
-        suppress_body = method.upper() == "HEAD" or status.startswith(("1", "204 ", "304 "))
+        suppress_body = method.upper() == "HEAD" or 100 <= code < 200 or code in (204, 304)
         discarded = response._stream if suppress_body and isinstance(response, StreamingResponse) else None
-        return _ResponseBody(b"" if suppress_body else body, finished, discarded)
+        return _PreparedResponse(code, response.status, headers,
+                                 _ResponseBody(b"" if suppress_body else body, finished, discarded))
+
+    def __call__(self, environ, start_response):
+        """WSGI 入口：只处理 environ 和 start_response 的协议转换。"""
+        prepared = self._prepare_response(
+            lambda: HTTPRequest.from_environ(environ, parse_body=False),
+            method=environ.get("REQUEST_METHOD", ""), path=environ.get("PATH_INFO", ""),
+            started=monotonic())
+        try:
+            start_response(f"{prepared.code} {prepared.reason}", prepared.headers)
+        except BaseException:
+            prepared.body._finish("start_failed")
+            raise
+        return prepared.body
 
     def _execute(self, request: HTTPRequest, func):
         # 匹配路由后执行 before，再绑定参数；异常交给 Application 统一处理。

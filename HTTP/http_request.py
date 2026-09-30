@@ -32,6 +32,7 @@ class HTTPRequest:
         self.script_name = ""
         self.scheme = "http"
         self.environ = None
+        self.scope = None
         self.version = version
         # HTTP Header 名称不区分大小写，统一转小写方便查找
         self.headers = {
@@ -168,6 +169,34 @@ class HTTPRequest:
         request.script_name = environ.get("SCRIPT_NAME", "").encode("iso-8859-1").decode("utf-8", "replace")
         request.scheme = environ.get("wsgi.url_scheme", "http")
         request.environ = environ
+        return request
+
+    @classmethod
+    def from_asgi_scope(cls, scope, body: bytes, *, parse_body=True):
+        """使用 ASGI 已解码的 path，不经过 WSGI environ 或二次路径解码。"""
+        root = scope.get("root_path", "")
+        path = scope["path"]
+        if root and (path == root or path.startswith(root + "/")):
+            path = path[len(root):] or "/"
+        query = scope.get("query_string", b"").decode("iso-8859-1")
+        target = quote(path or "/", safe="/") + ("?" + query if query else "")
+        headers = {"content-length": str(len(body))}
+        for raw_name, raw_value in scope.get("headers", ()):
+            name = raw_name.decode("ascii").lower()
+            if name == "content-length":
+                continue  # ASGI Server 已完成请求体分帧，使用实际收到的长度。
+            value = raw_value.decode("iso-8859-1")
+            if name in headers:
+                headers[name] += ("; " if name == "cookie" else ", ") + value
+            else:
+                headers[name] = value
+        request = cls(scope["method"], target, "HTTP/" + scope.get("http_version", "1.1"),
+                      headers, body, parse_body=parse_body)
+        request.path_info = path or "/"
+        request.query_string = query
+        request.script_name = root
+        request.scheme = scope.get("scheme", "http")
+        request.scope = scope
         return request
 
     @classmethod

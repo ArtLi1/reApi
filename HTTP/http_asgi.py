@@ -1,10 +1,10 @@
 """ASGI HTTP/lifespan 入口；同步框架逻辑在线程中运行。"""
 import asyncio
-import io
-import sys
 from threading import Event
+from time import monotonic
 
 from HTTP.http_application import HTTPApplication
+from HTTP.http_request import HTTPRequest
 
 
 class _ClientDisconnected(Exception):
@@ -52,7 +52,8 @@ class ASGIAdapter:
                 raise RuntimeError(f"Unexpected lifespan event: {event['type']}")
 
     async def _http(self, scope, receive, send):
-        body = bytearray()
+        chunks = []
+        body_size = 0
         while True:
             event = await receive()
             if event["type"] == "http.disconnect":
@@ -60,7 +61,9 @@ class ASGIAdapter:
             if event["type"] != "http.request":
                 raise RuntimeError(f"Unexpected HTTP event: {event['type']}")
             chunk = event.get("body", b"")
-            if len(body) + len(chunk) > self.max_body_bytes:
+            if type(chunk) is not bytes:
+                raise TypeError("ASGI request body must be bytes")
+            if body_size + len(chunk) > self.max_body_bytes:
                 # 属于传输层限制，与原生 Server 的协议错误一样直接返回 413。
                 payload = b"Request body too large"
                 await send({"type": "http.response.start", "status": 413,
@@ -69,11 +72,15 @@ class ASGIAdapter:
                 await send({"type": "http.response.body",
                             "body": b"" if scope["method"] == "HEAD" else payload})
                 return
-            body.extend(chunk)
+            body_size += len(chunk)
+            if chunk:
+                chunks.append(chunk)
             if not event.get("more_body", False):
                 break
 
-        environ = self._environ(scope, bytes(body))
+        # 单块直接复用；多块只在接收完毕后合并一次。
+        body = b"".join(chunks)
+        del chunks
         loop = asyncio.get_running_loop()
         disconnected = Event()
 
@@ -98,47 +105,20 @@ class ASGIAdapter:
                 raise _ClientDisconnected() from error
 
         def serve():
-            result = None
-            response_start = None
-            started = False
-
-            def start_response(status, headers, exc_info=None):
-                nonlocal response_start
-                if exc_info and started:
-                    raise exc_info[1].with_traceback(exc_info[2])
-                response_start = {"type": "http.response.start", "status": int(status[:3]),
-                                  "headers": self._asgi_headers(headers)}
-                return write
-
-            def write(data):
-                nonlocal started
-                if type(data) is not bytes:
-                    raise TypeError("WSGI response chunks must be bytes")
-                if response_start is None:
-                    raise RuntimeError("write() before start_response()")
-                if not started:
-                    sync_send(response_start)
-                    started = True
-                if data:
-                    sync_send({"type": "http.response.body", "body": data, "more_body": True})
-
+            prepared = None
             try:
-                result = self.application(environ, start_response)
-                for chunk in result:
-                    write(chunk)
-                if not started:
-                    if response_start is None:
-                        raise RuntimeError("WSGI application did not call start_response()")
-                    sync_send(response_start)
+                prepared = self.application._prepare_response(
+                    lambda: HTTPRequest.from_asgi_scope(scope, body, parse_body=False),
+                    method=scope["method"], path=scope["path"], started=monotonic())
+                sync_send({"type": "http.response.start", "status": prepared.code,
+                           "headers": self._asgi_headers(prepared.headers)})
+                for chunk in prepared.body:
+                    if chunk:
+                        sync_send({"type": "http.response.body", "body": chunk, "more_body": True})
                 sync_send({"type": "http.response.body", "body": b""})
             finally:
-                try:
-                    if result is not None:
-                        close = getattr(result, "close", None)
-                        if close is not None:
-                            close()
-                finally:
-                    environ["wsgi.input"].close()
+                if prepared is not None:
+                    prepared.body.close()
 
         watcher = asyncio.create_task(watch_disconnect())
         worker = asyncio.create_task(asyncio.to_thread(serve))
@@ -164,42 +144,3 @@ class ASGIAdapter:
     def _asgi_headers(headers):
         return [(name.lower().encode("ascii"), value.encode("iso-8859-1"))
                 for name, value in headers]
-
-    @staticmethod
-    def _environ(scope, body):
-        root = scope.get("root_path", "")
-        path = scope["path"]
-        if root and (path == root or path.startswith(root + "/")):
-            path = path[len(root):] or "/"
-        server = scope.get("server") or ("localhost", 80)
-        environ = {
-            "REQUEST_METHOD": scope["method"],
-            "SCRIPT_NAME": root.encode("utf-8").decode("iso-8859-1"),
-            "PATH_INFO": path.encode("utf-8").decode("iso-8859-1"),
-            "QUERY_STRING": scope.get("query_string", b"").decode("iso-8859-1"),
-            "SERVER_NAME": server[0],
-            "SERVER_PORT": str(server[1]) if server[1] is not None else "",
-            "SERVER_PROTOCOL": "HTTP/" + scope.get("http_version", "1.1"),
-            "CONTENT_LENGTH": str(len(body)),
-            "wsgi.version": (1, 0),
-            "wsgi.url_scheme": scope.get("scheme", "http"),
-            "wsgi.input": io.BytesIO(body),
-            "wsgi.errors": sys.stderr,
-            "wsgi.multithread": True,
-            "wsgi.multiprocess": False,
-            "wsgi.run_once": False,
-        }
-        if scope.get("client"):
-            environ["REMOTE_ADDR"] = scope["client"][0]
-            environ["REMOTE_PORT"] = str(scope["client"][1])
-        for raw_name, raw_value in scope.get("headers", ()):
-            name = raw_name.decode("ascii").lower()
-            if name == "content-length":
-                continue  # ASGI 的分块 Body 已经重新计算长度。
-            key = "CONTENT_TYPE" if name == "content-type" else "HTTP_" + name.upper().replace("-", "_")
-            value = raw_value.decode("iso-8859-1")
-            if key in environ:
-                environ[key] += ("; " if name == "cookie" else ", ") + value
-            else:
-                environ[key] = value
-        return environ

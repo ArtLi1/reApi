@@ -36,7 +36,7 @@ if __name__ == "__main__":
         HTTPServer(app).run()
 ```
 
-`HTTPApplication` 是 WSGI callable，可交给其他 WSGI Server；`HTTPServer` 也可运行普通 WSGI callable。WSGI 入口需显式调用 `startup()/shutdown()` 或 `lifecycle()`。ASGI 入口使用 `ASGIAdapter(app)`，通过 lifespan 自动启动和关闭模块；多进程部署时，在各工作进程中分别创建应用并启动资源。
+`HTTPApplication` 集中处理路由、校验、Hook、Middleware 和异常。它本身是 WSGI callable，可交给其他 WSGI Server；`HTTPServer` 也可运行普通 WSGI callable。WSGI 入口需显式调用 `startup()/shutdown()` 或 `lifecycle()`。ASGI 入口使用 `ASGIAdapter(app)`，从 ASGI `scope` 直接构造请求，通过 lifespan 自动启动和关闭模块。`HTTPRequest.environ` 仅在 WSGI 入口可用，`HTTPRequest.scope` 仅在 ASGI 入口可用；多进程部署时，在各工作进程中分别创建应用并启动资源。
 
 在上面的最小应用中，`/docs` 提供文档页面，`/openapi.json` 提供 OpenAPI 3.1.2 文档。
 

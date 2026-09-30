@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 from pydantic import BaseModel
 
-from HTTP.http_wsgi import validate_response
+from HTTP.http_validation import validate_response
 from Utils import ContentType
 
 
@@ -76,13 +76,14 @@ class HTTPResponse:
         self.set_cookie(name, "", path=path, domain=domain, max_age=0,
                         expires="Thu, 01 Jan 1970 00:00:00 GMT")
 
-    def _body_for_wsgi(self):
+    def _body_for_http(self):
         if type(self.body) is not bytes:
             raise TypeError("Response body must be bytes")
         return self.body, len(self.body)
 
-    def to_wsgi(self):
-        body, content_length = self._body_for_wsgi()
+    def to_http(self):
+        """准备两个入口共用的状态、响应头和 Body。"""
+        body, content_length = self._body_for_http()
         if isinstance(self.code, bool) or not isinstance(self.code, int):
             raise TypeError("Response code must be an integer")
         status = f"{self.code} {self.status}"
@@ -98,7 +99,11 @@ class HTTPResponse:
         if content_length is not None:
             headers.append(("Content-Length", str(content_length)))
         validate_response(status, headers)
-        return status, headers, body
+        return self.code, headers, body
+
+    def to_wsgi(self):
+        code, headers, body = self.to_http()
+        return f"{code} {self.status}", headers, body
 
     def response(self) -> bytes:
         """兼容旧的独立序列化调用；WSGI Server 不依赖这个方法。"""
@@ -126,12 +131,12 @@ class StreamingResponse(HTTPResponse):
         self.content_length = content_length
         self.headers.pop("Content-Length")
 
-    def _body_for_wsgi(self):
+    def _body_for_http(self):
         # 多次校验响应时只返回源迭代器，不在这里读取或打开资源。
         return self._stream, self.content_length
 
     def response(self):
-        raise TypeError("StreamingResponse must be consumed through WSGI")
+        raise TypeError("StreamingResponse must be consumed through WSGI or ASGI")
 
 
 class FileResponse(StreamingResponse):
